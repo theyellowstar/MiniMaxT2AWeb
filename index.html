@@ -98,8 +98,12 @@ main{
 .vb-gname{font-size:11.5px;color:var(--text3);margin-bottom:5px}
 .vb-n{color:var(--accent2)}
 .vb-chips{display:flex;flex-wrap:wrap;gap:6px}
-.vchip{font-size:12px;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:3px 11px;cursor:pointer;transition:.13s;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vchip{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:3px 7px 3px 11px;cursor:pointer;transition:.13s;max-width:210px}
 .vchip:hover{border-color:var(--accent);color:#fff}
+.vc-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.vc-play{border:none;background:rgba(34,211,238,.12);color:var(--accent2);font-size:10px;width:17px;height:17px;border-radius:50%;cursor:pointer;flex:none;line-height:1;display:inline-flex;align-items:center;justify-content:center;padding-left:2px}
+.vc-play:hover{background:var(--accent2);color:#06222a}
+.vc-play:disabled{opacity:.5;cursor:wait}
 .vchip.on{background:var(--grad);border-color:transparent;color:#fff}
 .vb-empty{font-size:12px;color:var(--text3)}
 
@@ -232,6 +236,7 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         <label>音色 Voice ID</label>
         <div class="voice-row">
           <input id="voiceId" list="voiceList" placeholder="选择或输入自定义音色 ID">
+          <button class="btn btn-sm" id="btnPreviewVoice" title="用当前音色合成一段短文试听">▶ 试听</button>
           <button class="btn btn-sm" id="btnFetchVoices">🎤 拉取我的音色</button>
         </div>
         <datalist id="voiceList">
@@ -647,6 +652,48 @@ async function fetchBlob(url){
   return await res.blob();
 }
 
+/* ==================== 音色试听 ==================== */
+const PV_TEXT = '欢迎使用MiniMax语音合成服务，这是音色试听。';
+const previewBusy = new Set();
+
+async function previewVoice(voiceId, btnEl){
+  if (!voiceId) return toast('请先选择或输入音色 ID', 'warn');
+  if (previewBusy.has(voiceId)) return toast('该音色正在试听中…', 'warn');
+  previewBusy.add(voiceId);
+  if (btnEl){ btnEl.disabled = true; btnEl.textContent = '试听中…'; }
+  try {
+    const cacheKey = 'pv:' + voiceId + ':' + settings.model;
+    let blob = await idbGet(cacheKey);
+    if (!blob){
+      const body = {
+        model: settings.model,
+        text: PV_TEXT,
+        stream: false,
+        output_format: 'hex',
+        voice_setting: { voice_id: voiceId, speed: +settings.speed, vol: +settings.vol, pitch: +settings.pitch },
+        audio_setting: { sample_rate: 24000, bitrate: 64000, format: 'mp3', channel: 1 }
+      };
+      const res = await apiCall('/v1/t2a_v2', { method:'POST', body });
+      const d = res.data || {};
+      let url = '';
+      ['audio', 'audio_file', 'audio_url'].some(k => {
+        const v = d[k];
+        if (typeof v === 'string' && /^https?:\/\//i.test(v)){ url = v; return true; }
+        return false;
+      });
+      if (url) blob = await fetchBlob(url);
+      else if (typeof d.audio === 'string') blob = new Blob([hexToBytes(d.audio)], { type:'audio/mpeg' });
+      if (!blob) throw new Error('试听接口未返回音频');
+      idbPut(cacheKey, blob); // 本地缓存：同一音色+模型再次试听直接秒开，不重复计费
+    }
+    playBlobInPlayer(blob, '试听：' + voiceId);
+  } catch(err){ toast('试听失败：' + err.message, 'error'); }
+  finally {
+    previewBusy.delete(voiceId);
+    if (btnEl){ btnEl.disabled = false; btnEl.textContent = '▶ 试听'; }
+  }
+}
+
 /* ==================== 音色拉取（官方 get_voice 接口） ==================== */
 const VOICE_GROUP_NAMES = { system_voice:'系统音色', voice_cloning:'复刻音色', voice_generation:'文生音色' };
 let voiceBank = loadJSON(LS_VOICES, { ts:0, groups:{ system_voice:[], voice_cloning:[], voice_generation:[] } });
@@ -709,9 +756,12 @@ function renderVoiceBank(open){
     for (const v of list){
       const c = document.createElement('span');
       c.className = 'vchip' + (v.id === $('#voiceId').value ? ' on' : '');
-      c.textContent = v.name;
-      c.title = v.id;
-      c.addEventListener('click', () => {
+      c.innerHTML = `<span class="vc-name" title="${esc(v.id)}">${esc(v.name)}</span><button class="vc-play" title="试听此音色">▶</button>`;
+      c.addEventListener('click', e => {
+        if (e.target.closest('.vc-play')){ // 点击 ▶ 只试听，不选中
+          previewVoice(v.id, e.target.closest('.vc-play'));
+          return;
+        }
         $('#voiceId').value = v.id;
         settings.voiceId = v.id; saveSettings();
         $$('.vchip', box).forEach(x => x.classList.remove('on'));
@@ -1304,8 +1354,9 @@ function bindEvents(){
   $('#pitch').addEventListener('input', () => $('#vPitch').textContent = (+$('#pitch').value).toFixed(0));
   $('#autoPoll').addEventListener('change', syncSettingsFromForm);
 
-  // 音色拉取
+  // 音色拉取 / 试听
   $('#btnFetchVoices').addEventListener('click', fetchVoices);
+  $('#btnPreviewVoice').addEventListener('click', () => previewVoice($('#voiceId').value.trim(), $('#btnPreviewVoice')));
   $('#voiceBankFilter').addEventListener('input', () => renderVoiceBank());
   $('#btnVoiceBankToggle').addEventListener('click', () => {
     const g = $('#voiceBankGroups');
