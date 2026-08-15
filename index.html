@@ -112,6 +112,7 @@ main{
 .file-upload{margin:2px 0 10px;border:1px dashed var(--border2);border-radius:11px;padding:11px;background:var(--bg2)}
 .fu-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .fu-row input[type=file]{flex:1;min-width:180px;font-size:12.5px;padding:6px 8px}
+.up-tip{font-size:11.5px;color:var(--text3);margin-top:8px;line-height:1.5}
 .up-info{margin-top:8px;font-size:12.5px;color:var(--text2);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .up-info .mono{font-family:ui-monospace,Consolas,monospace;color:var(--accent2);font-size:12px}
 .exf-row{display:flex;gap:8px;align-items:center;margin-bottom:5px;font-size:12px;color:var(--text2)}
@@ -398,7 +399,9 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         <div class="fu-row">
           <input type="file" id="textFileInput" accept=".txt,.zip">
           <button class="btn btn-sm" id="btnUploadTextFile">⬆ 上传文本文件</button>
+          <button class="btn btn-sm" id="btnSplitZip" title="把文本框内容或所选 txt 按章节拆分成 zip 下载">📦 拆分生成 zip</button>
         </div>
+        <div class="up-tip">单 txt 上限 <b>10 万字符</b>，超出会自动拆分为多章节打包成 zip 上传（zip 合计 ≤100 万字符）；zip 内须为同一格式的 txt / json 文件</div>
         <div class="up-info" id="uploadedFileInfo" style="display:none"></div>
       </div>
       <div class="field" data-only="async">
@@ -675,7 +678,7 @@ async function apiCall(path, { method='GET', body=null, formData=null } = {}){
   try { data = await res.json(); } catch(e){ if (!res.ok) throw new Error('HTTP ' + res.status + '（响应非 JSON）'); }
   if (data && data.base_resp && data.base_resp.status_code !== 0){
     const c = data.base_resp.status_code, m = data.base_resp.status_msg || '';
-    throw new Error('接口错误 [' + c + '] ' + (CODE_MSG[c] || m));
+    throw new Error('接口错误 [' + c + '] ' + (CODE_MSG[c] || '') + (m ? '（服务端：' + m + '）' : ''));
   }
   return data || {};
 }
@@ -1105,6 +1108,88 @@ async function tick(){
   ticking = false;
 }
 
+/* ---- 纯 JS zip 打包（STORE 无压缩，用于拆分章节） ---- */
+function crc32(buf){
+  if (!crc32.table){
+    crc32.table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++){
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      crc32.table[n] = c;
+    }
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) crc = crc32.table[(crc ^ buf[i]) & 0xFF] ^ (crc >>> 8);
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function buildZip(files){ // files: [{name, data:Uint8Array}]
+  const enc = new TextEncoder();
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files){
+    const nameBytes = enc.encode(f.name);
+    const crc = crc32(f.data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true);
+    lh.setUint16(6, 0x0800, true); // UTF-8 文件名
+    lh.setUint32(14, crc, true);
+    lh.setUint32(18, f.data.length, true);
+    lh.setUint32(22, f.data.length, true);
+    lh.setUint16(26, nameBytes.length, true);
+    parts.push(new Uint8Array(lh.buffer), nameBytes, f.data);
+    const cd = new DataView(new ArrayBuffer(46));
+    cd.setUint32(0, 0x02014b50, true);
+    cd.setUint16(4, 20, true);
+    cd.setUint16(6, 20, true);
+    cd.setUint16(8, 0x0800, true);
+    cd.setUint32(16, crc, true);
+    cd.setUint32(20, f.data.length, true);
+    cd.setUint32(24, f.data.length, true);
+    cd.setUint16(28, nameBytes.length, true);
+    cd.setUint32(42, offset, true);
+    central.push(new Uint8Array(cd.buffer), nameBytes);
+    offset += 30 + nameBytes.length + f.data.length;
+  }
+  let cdSize = 0;
+  for (const c of central) cdSize += c.length;
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, files.length, true);
+  eocd.setUint16(10, files.length, true);
+  eocd.setUint32(12, cdSize, true);
+  eocd.setUint32(16, offset, true);
+  parts.push(...central, new Uint8Array(eocd.buffer));
+  return new Blob(parts, { type:'application/zip' });
+}
+
+function splitChapters(text, max){
+  const chapters = [];
+  let rest = text;
+  while (rest.length > max){
+    let cut = rest.lastIndexOf('\n', max);
+    if (cut <= max * 0.5) cut = max;
+    chapters.push(rest.slice(0, cut));
+    rest = rest.slice(cut).replace(/^[\s\n]+/, '');
+  }
+  if (rest.trim()) chapters.push(rest);
+  return chapters;
+}
+
+async function splitToZipDownload(){
+  let content = '';
+  const f = $('#textFileInput').files[0];
+  if (f && /\.txt$/i.test(f.name)) content = await f.text();
+  else content = $('#textInput').value;
+  if (!content.trim()) return toast('没有可拆分的文本（请先选择 txt 文件，或在文本框中输入内容）', 'warn');
+  const chapters = splitChapters(content, 90000);
+  const enc = new TextEncoder();
+  const zip = buildZip(chapters.map((ch, i) => ({ name:'chapter_' + (i + 1).toString().padStart(3, '0') + '.txt', data: enc.encode(ch) })));
+  downloadBlob(zip, 'chapters_' + chapters.length + '.zip');
+  toast('✅ 已生成 zip：' + chapters.length + ' 个章节，每章 <9 万字符；选择该 zip 上传即可');
+}
+
 /* ---- 文本文件上传（text_file_id） ---- */
 function refreshUploadedFileInfo(){
   const box = $('#uploadedFileInfo');
@@ -1116,12 +1201,24 @@ function refreshUploadedFileInfo(){
 }
 
 async function uploadTextFile(){
-  const f = $('#textFileInput').files[0];
+  let f = $('#textFileInput').files[0];
   if (!f) return toast('请先选择 txt / zip 文件', 'warn');
-  if (f.size > 5 * 1024 * 1024 && !confirm('文件较大（' + fmtBytes(f.size) + '），仍要上传吗？')) return;
   const btn = $('#btnUploadTextFile');
   btn.disabled = true; btn.textContent = '上传中…';
   try {
+    // 官方限制：单个 txt < 10 万字符，超出会报 2013 —— 自动拆分打包为 zip
+    if (/\.txt$/i.test(f.name)){
+      const content = await f.text();
+      if (content.length >= 100000){
+        const chapters = splitChapters(content, 90000);
+        if (!confirm('该 txt 约 ' + content.length.toLocaleString() + ' 字符，超过官方 10 万字符上限（直接上传会报 2013）。\n将自动拆分为 ' + chapters.length + ' 个章节（每章 <9 万字符）打包为 zip 上传，继续吗？')) return;
+        const enc = new TextEncoder();
+        const zip = buildZip(chapters.map((ch, i) => ({ name:'chapter_' + (i + 1).toString().padStart(3, '0') + '.txt', data: enc.encode(ch) })));
+        f = new File([zip], f.name.replace(/\.txt$/i, '') + '_chapters_' + chapters.length + '.zip', { type:'application/zip' });
+        toast('已拆分为 ' + chapters.length + ' 个章节，开始上传 zip');
+      }
+    }
+    if (f.size > 5 * 1024 * 1024 && !confirm('文件较大（' + fmtBytes(f.size) + '），仍要上传吗？')) return;
     const fd = new FormData();
     fd.append('file', f);
     fd.append('purpose', 't2a_async_input');
@@ -1579,6 +1676,7 @@ function bindEvents(){
   // 文本文件上传
   $('#useTextFile').addEventListener('change', () => { syncSettingsFromForm(); updateFileModeUI(); });
   $('#btnUploadTextFile').addEventListener('click', uploadTextFile);
+  $('#btnSplitZip').addEventListener('click', splitToZipDownload);
   $('#textFileInput').addEventListener('change', e => {
     const f = e.target.files[0];
     if (f) toast('已选择：' + f.name + '（' + fmtBytes(f.size) + '），点击「上传」后生效');
