@@ -109,6 +109,14 @@ main{
 .sub-sec{margin-top:10px;border-top:1px dashed var(--border2);padding-top:10px}
 .sub-sec .st{font-size:12px;color:var(--text2);margin-bottom:6px}
 .subprev{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:8px}
+.file-upload{margin:2px 0 10px;border:1px dashed var(--border2);border-radius:11px;padding:11px;background:var(--bg2)}
+.fu-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fu-row input[type=file]{flex:1;min-width:180px;font-size:12.5px;padding:6px 8px}
+.up-info{margin-top:8px;font-size:12.5px;color:var(--text2);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.up-info .mono{font-family:ui-monospace,Consolas,monospace;color:var(--accent2);font-size:12px}
+.exf-row{display:flex;gap:8px;align-items:center;margin-bottom:5px;font-size:12px;color:var(--text2)}
+.exf-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exf-err{color:var(--err);font-size:11.5px}
 
 [data-only]{display:none}
 body[mode=async] [data-only=async]{display:block}
@@ -380,6 +388,20 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         </div>
       </div>
       <div class="field" data-only="async">
+        <label>文本输入方式</label>
+        <div class="row">
+          <input type="checkbox" id="useTextFile">
+          <span>上传文件（txt / zip，突破 5 万字符直传限制）</span>
+        </div>
+      </div>
+      <div class="file-upload" id="fileUploadBox" data-only="async" style="grid-column:1/-1;display:none">
+        <div class="fu-row">
+          <input type="file" id="textFileInput" accept=".txt,.zip">
+          <button class="btn btn-sm" id="btnUploadTextFile">⬆ 上传文本文件</button>
+        </div>
+        <div class="up-info" id="uploadedFileInfo" style="display:none"></div>
+      </div>
+      <div class="field" data-only="async">
         <label>轮询间隔</label>
         <select id="pollInterval">
           <option value="3000">3 秒</option>
@@ -553,6 +575,7 @@ let settings = loadJSON(LS_SETTINGS, {
   sampleRate:32000, bitrate:128000, format:'mp3', channel:1,
   languageBoost:'', outputFormat:'hex', emotion:'',
   subtitleEnable:false,
+  useTextFile:false, textFileId:'', textFileName:'', textFileTs:0,
   autoPoll:true, pollInterval:5000
 });
 function saveSettings(){ try { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); } catch(e){ toast('设置保存失败：' + e.message, 'error'); } }
@@ -634,7 +657,7 @@ const CODE_MSG = {
   2013:'请求参数错误'
 };
 
-async function apiCall(path, { method='GET', body=null } = {}){
+async function apiCall(path, { method='GET', body=null, formData=null } = {}){
   if (!settings.apiKey) throw new Error('请先在右上角「设置」中填写 API Key');
   let url = (settings.proxy || '') + settings.baseUrl.replace(/\/+$/, '') + path;
   if (settings.groupId) url += (url.includes('?') ? '&' : '?') + 'GroupId=' + encodeURIComponent(settings.groupId);
@@ -643,7 +666,7 @@ async function apiCall(path, { method='GET', body=null } = {}){
     res = await fetch(url, {
       method,
       headers: { 'Authorization': 'Bearer ' + settings.apiKey, ...(body ? { 'Content-Type':'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined
+      body: formData ? formData : (body ? JSON.stringify(body) : undefined)
     });
   } catch(err){
     throw new Error('网络请求失败：' + err.message + '（若为 CORS 拦截，可在设置中配置代理前缀）');
@@ -801,12 +824,17 @@ function buildAudioSetting(isAsync){
 function buildCommonBody(text, isAsync){
   const b = {
     model: settings.model,
-    text,
     voice_setting: buildVoiceSetting(),
     audio_setting: buildAudioSetting(isAsync)
   };
-  if (!isAsync) b.stream = false;
-  else if (settings.subtitleEnable) b.subtitle_enable = true;
+  if (!isAsync){
+    b.text = text;
+    b.stream = false;
+  } else {
+    if (settings.useTextFile && settings.textFileId) b.text_file_id = settings.textFileId;
+    else b.text = text;
+    if (settings.subtitleEnable) b.subtitle_enable = true;
+  }
   if (settings.languageBoost) b.language_boost = settings.languageBoost;
   return b;
 }
@@ -872,16 +900,20 @@ function addFailedEntry(mode, text, errMsg){
 const querying = new Set();
 
 async function runAsyncCreate(){
+  const useFile = settings.useTextFile && !!settings.textFileId;
+  if (settings.useTextFile && !settings.textFileId) return toast('文件模式下请先选择并上传 txt/zip 文本文件', 'error');
   const text = $('#textInput').value.trim();
-  if (!text) return toast('请输入要合成的文本', 'error');
-  if (text.length > 50000 && !confirm('异步接口文本上限约 5 万字符，仍要提交吗？')) return;
+  if (!useFile && !text) return toast('请输入要合成的文本，或勾选「上传文件」', 'error');
+  if (!useFile && text.length > 50000 && !confirm('异步接口直传文本上限约 5 万字符，建议使用文件上传；仍要直传提交吗？')) return;
   setBusy(true);
   try {
     const res = await apiCall('/v1/t2a_async_v2', { method:'POST', body: buildCommonBody(text, true) });
     if (res.task_id == null) throw new Error('未返回 task_id，响应：' + JSON.stringify(res).slice(0, 300));
 
     const entry = {
-      id: uuid(), mode: 'async', ts: Date.now(), text,
+      id: uuid(), mode: 'async', ts: Date.now(),
+      text: useFile ? '（文本文件：' + settings.textFileName + '）' : text,
+      textFileId: useFile ? settings.textFileId : '',
       voiceId: settings.voiceId, model: settings.model, format: settings.format,
       speed: +settings.speed, vol: +settings.vol, pitch: +settings.pitch,
       status: 'success', taskStatus: 'Processing',
@@ -908,13 +940,18 @@ async function queryTaskById(id, { silent=false } = {}){
   try {
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(entry.taskId));
     entry.taskStatus = String(res.status || entry.taskStatus || 'Processing');
-    if (res.file_id != null) entry.fileId = String(res.file_id);
+    if (Array.isArray(res.file_id)){ // zip 多章节可能一次返回多个文件 ID
+      const ids = res.file_id.map(String);
+      entry.fileId = ids[0];
+      entry.extraFileIds = ids.slice(1);
+    } else if (res.file_id != null) entry.fileId = String(res.file_id);
     const subId = pickSubtitleId(res);
     if (subId) entry.subtitleFileId = subId;
     if (entry.taskStatus === 'Success'){
       if (!entry.fileId) throw new Error('任务成功但未返回 file_id');
       await retrieveById(id, { silent: true });
       if (entry.subtitleFileId) await retrieveSubtitle(id, { silent: true });
+      if (entry.extraFileIds && entry.extraFileIds.length) await retrieveExtraFiles(id);
     } else if (entry.taskStatus === 'Failed' || entry.taskStatus === 'Expired'){
       entry.errMsg = '任务' + (TASK_STATUS[entry.taskStatus] || entry.taskStatus) +
         (res.base_resp && res.base_resp.status_msg ? '：' + res.base_resp.status_msg : '');
@@ -952,6 +989,9 @@ async function retrieveById(id, { silent=false } = {}){
         try { entry.subtitlePreview = (await sblob.text()).slice(0, 400); } catch(_){}
       } catch(e){}
     }
+    // 其余文件（如 zip 多章节的多个音频）作为附加文件保存
+    const extras = files.filter(x => x !== f && x !== subFile).map(x => ({ fileId:'', url:x.download_url || '', filename:x.filename || '' }));
+    if (extras.length) entry.extraFiles = entry.extraFiles ? entry.extraFiles.concat(extras) : extras;
     entry.urlExpiresAt = Date.now() + 9 * 3600 * 1000; // 官方文档：9 小时有效
     upsertHistory(entry);
     renderHistory();
@@ -1017,6 +1057,38 @@ async function downloadSubtitle(id){
   else toast('没有可下载的字幕', 'error');
 }
 
+async function retrieveExtraFiles(id){
+  const entry = history.find(h => h.id === id);
+  if (!entry || !entry.extraFileIds || !entry.extraFileIds.length) return;
+  const out = [];
+  for (const fid of entry.extraFileIds){
+    try {
+      const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(fid));
+      const f = Array.isArray(res.file) ? res.file[0] : res.file;
+      if (f && f.download_url) out.push({ fileId:fid, url:f.download_url, filename:f.filename || ('file_' + fid) });
+      else out.push({ fileId:fid, url:'', filename:'file_' + fid, error:'未获取到链接' });
+    } catch(err){ out.push({ fileId:fid, url:'', filename:'file_' + fid, error:err.message }); }
+  }
+  entry.extraFiles = out;
+  upsertHistory(entry);
+  renderHistory();
+  renderAsyncResultIfActive(id);
+}
+
+async function downloadExtra(id, idx){
+  const e = history.find(h => h.id === id);
+  if (!e || !e.extraFiles || !e.extraFiles[idx]) return;
+  const x = e.extraFiles[idx];
+  if (!x.url) return toast('该文件无下载链接：' + (x.error || ''), 'error');
+  try {
+    const blob = await fetchBlob(x.url);
+    downloadBlob(blob, x.filename || ('minimax_extra_' + idx + '_' + fileTs(e.ts)));
+  } catch(err){
+    window.open(x.url, '_blank');
+    toast('无法内嵌下载，已在新标签页打开', 'warn');
+  }
+}
+
 /* ---- 轮询 ---- */
 let tickTimer = null, ticking = false;
 function setupTicker(){
@@ -1031,6 +1103,52 @@ async function tick(){
   ticking = true;
   for (const h of pend) await queryTaskById(h.id, { silent: true });
   ticking = false;
+}
+
+/* ---- 文本文件上传（text_file_id） ---- */
+function refreshUploadedFileInfo(){
+  const box = $('#uploadedFileInfo');
+  if (!settings.textFileId){ box.style.display = 'none'; return; }
+  box.innerHTML = '已上传：<b>' + esc(settings.textFileName || '文件') + '</b> · text_file_id: <span class="mono">' + esc(settings.textFileId) + '</span>'
+    + ' <button class="btn btn-sm" id="btnCopyTextFileId">📋 复制</button>'
+    + ' <button class="btn btn-sm" id="btnClearTextFile">清除</button>';
+  box.style.display = '';
+}
+
+async function uploadTextFile(){
+  const f = $('#textFileInput').files[0];
+  if (!f) return toast('请先选择 txt / zip 文件', 'warn');
+  if (f.size > 5 * 1024 * 1024 && !confirm('文件较大（' + fmtBytes(f.size) + '），仍要上传吗？')) return;
+  const btn = $('#btnUploadTextFile');
+  btn.disabled = true; btn.textContent = '上传中…';
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('purpose', 't2a_async_input');
+    const res = await apiCall('/v1/files/upload', { method:'POST', formData: fd });
+    const fid = res.file_id ?? (res.file && res.file.file_id);
+    if (fid == null) throw new Error('上传响应中未返回 file_id：' + JSON.stringify(res).slice(0, 200));
+    settings.textFileId = String(fid);
+    settings.textFileName = f.name;
+    settings.textFileTs = Date.now();
+    saveSettings();
+    refreshUploadedFileInfo();
+    toast('✅ 文本文件上传成功，创建任务时将使用 text_file_id');
+  } catch(err){ toast('上传失败：' + err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = '⬆ 上传文本文件'; }
+}
+
+function updateFileModeUI(){
+  const on = $('#useTextFile').checked;
+  const box = $('#fileUploadBox');
+  if (box) box.style.display = on ? '' : 'none';
+  const ta = $('#textInput');
+  ta.disabled = on;
+  ta.style.opacity = on ? '.45' : '';
+  ta.placeholder = on ? '文件模式下忽略此处文本，使用已上传的 txt/zip 文件' : '输入要合成的文本…\n\n提示：支持 <#1#> 停顿标记（如「你好<#1#>欢迎收听」）；speech-2.8 系列还支持语气词标签，如 (sighs)、(laughs)';
+  if (on) refreshUploadedFileInfo();
+  const lab = $('#submitBtn .lab');
+  if (lab) lab.textContent = document.body.getAttribute('mode') === 'async' ? (on ? '🚀 创建异步任务（文件）' : '🚀 创建异步任务') : '🚀 发起合成';
 }
 
 /* ---- 手动查询 / 下载 ---- */
@@ -1201,6 +1319,11 @@ function renderAsyncResult(entry){
     <div class="sub-sec">
       <div class="st">💬 字幕文件（时间戳精确到句）${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''}</div>
       ${entry.subtitlePreview ? `<div class="subprev">${esc(entry.subtitlePreview)}</div>` : ''}
+    </div>` : ''}
+    ${entry.extraFiles && entry.extraFiles.length ? `
+    <div class="sub-sec">
+      <div class="st">📎 附加文件 ×${entry.extraFiles.length}</div>
+      ${entry.extraFiles.map((x, i) => `<div class="exf-row"><span class="exf-name" title="${esc(x.fileId)}">${esc(x.filename || ('文件 ' + (i + 1)))}</span>${x.url ? `<button class="btn btn-sm" data-act="dlExtra" data-id="${entry.id}" data-idx="${i}">⬇ 下载</button>` : `<span class="exf-err">${esc(x.error || '获取失败')}</span>`}</div>`).join('')}
     </div>` : ''}`;
   el.classList.add('show');
 }
@@ -1255,6 +1378,8 @@ function historyItemHtml(e){
   if (e.taskId) meta.push('task_id: <span class="mono">' + esc(e.taskId) + '</span>');
   if (e.fileId) meta.push('file_id: <span class="mono">' + esc(e.fileId) + '</span>');
   if (e.subtitleFileId) meta.push('subtitle_id: <span class="mono">' + esc(e.subtitleFileId) + '</span>');
+  if (e.textFileId) meta.push('text_file_id: <span class="mono">' + esc(e.textFileId) + '</span>');
+  if (e.extraFiles && e.extraFiles.length) meta.push('附加文件 ×' + e.extraFiles.length);
   if (e.audioCached) meta.push('🎧 已缓存');
   if (e.downloadUrl && e.urlExpiresAt && !e.audioCached && e.urlExpiresAt < Date.now()) meta.push('<span style="color:var(--err)">链接已过期，可尝试重新获取</span>');
   if (e.errMsg || e.lastErr) meta.push('<span style="color:var(--err)">' + esc((e.errMsg || e.lastErr).slice(0, 80)) + '</span>');
@@ -1306,7 +1431,9 @@ function syncFormFromSettings(){
   $('#emotion').value = settings.emotion || '';
   $('#autoPoll').checked = settings.autoPoll !== false;
   $('#subtitleEnable').checked = !!settings.subtitleEnable;
+  $('#useTextFile').checked = !!settings.useTextFile;
   $('#pollInterval').value = String(settings.pollInterval || 5000);
+  updateFileModeUI();
 }
 function syncSettingsFromForm(){
   settings.voiceId = $('#voiceId').value.trim() || 'male-qn-qingse';
@@ -1319,6 +1446,7 @@ function syncSettingsFromForm(){
   settings.emotion = $('#emotion').value.trim();
   settings.autoPoll = $('#autoPoll').checked;
   settings.subtitleEnable = $('#subtitleEnable').checked;
+  settings.useTextFile = $('#useTextFile').checked;
   settings.pollInterval = +$('#pollInterval').value;
   saveSettings();
   setupTicker();
@@ -1350,8 +1478,8 @@ function switchTab(mode){
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === mode));
   $('#modeHint').textContent = mode === 'sync'
     ? '同步模式 · 建议单次不超过 1 万字符'
-    : '异步模式 · 长文本（上限约 5 万字符），创建后轮询获取结果';
-  $('#submitBtn .lab').textContent = mode === 'sync' ? '🚀 发起合成' : '🚀 创建异步任务';
+    : '异步模式 · 直传上限约 5 万字符；更长文本请勾选「上传文件」（txt/zip，最大约 100 万字符）';
+  updateFileModeUI();
 }
 function updateCount(){
   const n = $('#textInput').value.length;
@@ -1447,6 +1575,22 @@ function bindEvents(){
   // 音色拉取 / 试听
   $('#btnFetchVoices').addEventListener('click', fetchVoices);
   $('#btnPreviewVoice').addEventListener('click', () => previewVoice($('#voiceId').value.trim(), $('#btnPreviewVoice')));
+
+  // 文本文件上传
+  $('#useTextFile').addEventListener('change', () => { syncSettingsFromForm(); updateFileModeUI(); });
+  $('#btnUploadTextFile').addEventListener('click', uploadTextFile);
+  $('#textFileInput').addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (f) toast('已选择：' + f.name + '（' + fmtBytes(f.size) + '），点击「上传」后生效');
+  });
+  $('#uploadedFileInfo').addEventListener('click', e => {
+    if (e.target.closest('#btnCopyTextFileId')) copyText(settings.textFileId);
+    else if (e.target.closest('#btnClearTextFile')){
+      settings.textFileId = ''; settings.textFileName = ''; settings.textFileTs = 0;
+      saveSettings(); refreshUploadedFileInfo();
+      toast('已清除已上传的文件 ID');
+    }
+  });
   $('#voiceBankFilter').addEventListener('input', () => renderVoiceBank());
   $('#btnVoiceBankToggle').addEventListener('click', () => {
     const g = $('#voiceBankGroups');
@@ -1482,6 +1626,7 @@ function bindEvents(){
     else if (act === 'retrieve') retrieveById(id);
     else if (act === 'retrieveSub') retrieveSubtitle(id);
     else if (act === 'downloadSub') downloadSubtitle(id);
+    else if (act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
     else if (act === 'copytask'){
       const en = history.find(h => h.id === id);
       if (en && en.taskId) copyText(en.taskId);
@@ -1504,6 +1649,7 @@ function bindEvents(){
       else if (btn.dataset.act === 'retrieve') retrieveById(id);
       else if (btn.dataset.act === 'retrieveSub') retrieveSubtitle(id);
       else if (btn.dataset.act === 'downloadSub') downloadSubtitle(id);
+      else if (btn.dataset.act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
       else if (btn.dataset.act === 'copytask'){
         const en = history.find(h => h.id === id);
         if (en && en.taskId) copyText(en.taskId);
