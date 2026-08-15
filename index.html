@@ -106,6 +106,9 @@ main{
 .vc-play:disabled{opacity:.5;cursor:wait}
 .vchip.on{background:var(--grad);border-color:transparent;color:#fff}
 .vb-empty{font-size:12px;color:var(--text3)}
+.sub-sec{margin-top:10px;border-top:1px dashed var(--border2);padding-top:10px}
+.sub-sec .st{font-size:12px;color:var(--text2);margin-bottom:6px}
+.subprev{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;max-height:140px;overflow:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:8px}
 
 [data-only]{display:none}
 body[mode=async] [data-only=async]{display:block}
@@ -370,6 +373,13 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         </div>
       </div>
       <div class="field" data-only="async">
+        <label>字幕</label>
+        <div class="row">
+          <input type="checkbox" id="subtitleEnable">
+          <span>生成字幕文件（时间戳精确到句）</span>
+        </div>
+      </div>
+      <div class="field" data-only="async">
         <label>轮询间隔</label>
         <select id="pollInterval">
           <option value="3000">3 秒</option>
@@ -542,6 +552,7 @@ let settings = loadJSON(LS_SETTINGS, {
   speed:1, vol:1, pitch:0,
   sampleRate:32000, bitrate:128000, format:'mp3', channel:1,
   languageBoost:'', outputFormat:'hex', emotion:'',
+  subtitleEnable:false,
   autoPoll:true, pollInterval:5000
 });
 function saveSettings(){ try { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); } catch(e){ toast('设置保存失败：' + e.message, 'error'); } }
@@ -795,6 +806,7 @@ function buildCommonBody(text, isAsync){
     audio_setting: buildAudioSetting(isAsync)
   };
   if (!isAsync) b.stream = false;
+  else if (settings.subtitleEnable) b.subtitle_enable = true;
   if (settings.languageBoost) b.language_boost = settings.languageBoost;
   return b;
 }
@@ -897,9 +909,12 @@ async function queryTaskById(id, { silent=false } = {}){
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(entry.taskId));
     entry.taskStatus = String(res.status || entry.taskStatus || 'Processing');
     if (res.file_id != null) entry.fileId = String(res.file_id);
+    const subId = pickSubtitleId(res);
+    if (subId) entry.subtitleFileId = subId;
     if (entry.taskStatus === 'Success'){
       if (!entry.fileId) throw new Error('任务成功但未返回 file_id');
       await retrieveById(id, { silent: true });
+      if (entry.subtitleFileId) await retrieveSubtitle(id, { silent: true });
     } else if (entry.taskStatus === 'Failed' || entry.taskStatus === 'Expired'){
       entry.errMsg = '任务' + (TASK_STATUS[entry.taskStatus] || entry.taskStatus) +
         (res.base_resp && res.base_resp.status_msg ? '：' + res.base_resp.status_msg : '');
@@ -920,10 +935,23 @@ async function retrieveById(id, { silent=false } = {}){
   if (!entry || !entry.fileId) return;
   try {
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.fileId));
-    const f = Array.isArray(res.file) ? res.file[0] : res.file;
+    const files = Array.isArray(res.file) ? res.file : [res.file].filter(Boolean);
+    const f = files.find(x => !/subtitle/i.test(String(x.filename || '')) && !/\.json$/i.test(String(x.filename || ''))) || files[0];
     if (!f || !f.download_url) throw new Error('未获取到下载链接');
     entry.downloadUrl = f.download_url;
     entry.fileName = f.filename || '';
+    // 部分版本下 files/retrieve 会一次性返回音频 + 字幕等多个文件
+    const subFile = files.find(x => x !== f && (/subtitle/i.test(String(x.filename || '')) || /\.json$/i.test(String(x.filename || ''))));
+    if (subFile && subFile.download_url){
+      entry.subtitleUrl = subFile.download_url;
+      entry.subtitleFileName = subFile.filename || '';
+      try {
+        const sblob = await fetchBlob(entry.subtitleUrl);
+        await idbPut('sub:' + entry.id, sblob);
+        entry.subtitleCached = true;
+        try { entry.subtitlePreview = (await sblob.text()).slice(0, 400); } catch(_){}
+      } catch(e){}
+    }
     entry.urlExpiresAt = Date.now() + 9 * 3600 * 1000; // 官方文档：9 小时有效
     upsertHistory(entry);
     renderHistory();
@@ -941,6 +969,52 @@ async function retrieveById(id, { silent=false } = {}){
     if (!silent) toast(err.message, 'error');
     throw err;
   }
+}
+
+/* ---- 字幕 ---- */
+function pickSubtitleId(res){
+  const v = res.subtitle_file_id ?? res.subtitle_file ?? res.subtitle_id
+    ?? (res.extra_info && (res.extra_info.subtitle_file_id || res.extra_info.subtitle_file || res.extra_info.subtitle_id));
+  return v != null ? String(v) : '';
+}
+
+async function retrieveSubtitle(id, { silent=false } = {}){
+  const entry = history.find(h => h.id === id);
+  if (!entry || !entry.subtitleFileId) return;
+  try {
+    const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.subtitleFileId));
+    const f = Array.isArray(res.file) ? res.file[0] : res.file;
+    if (!f || !f.download_url) throw new Error('未获取到字幕下载链接');
+    entry.subtitleUrl = f.download_url;
+    entry.subtitleFileName = f.filename || '';
+    try {
+      const blob = await fetchBlob(entry.subtitleUrl);
+      await idbPut('sub:' + entry.id, blob);
+      entry.subtitleCached = true;
+      try { entry.subtitlePreview = (await blob.text()).slice(0, 400); } catch(_){}
+    } catch(e){}
+    upsertHistory(entry);
+    renderHistory();
+    renderAsyncResultIfActive(id);
+    if (!silent) toast('✅ 已获取字幕文件');
+  } catch(err){ if (!silent) toast(err.message, 'error'); }
+}
+
+async function downloadSubtitle(id){
+  const e = history.find(h => h.id === id);
+  if (!e) return;
+  let blob = null;
+  if (e.subtitleCached){ try { blob = await idbGet('sub:' + id); } catch(_){} }
+  if (!blob && e.subtitleUrl){
+    try {
+      blob = await fetchBlob(e.subtitleUrl);
+      await idbPut('sub:' + id, blob);
+      e.subtitleCached = true; upsertHistory(e);
+    } catch(_){}
+  }
+  if (blob) downloadBlob(blob, 'minimax_subtitle_' + fileTs(e.ts) + '.json');
+  else if (e.subtitleUrl) window.open(e.subtitleUrl, '_blank');
+  else toast('没有可下载的字幕', 'error');
 }
 
 /* ---- 轮询 ---- */
@@ -966,16 +1040,19 @@ async function manualQuery(){
   setManualBusy(true);
   try {
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(tid));
+    const subId = pickSubtitleId(res);
     const entry = {
       id: uuid(), mode: 'async', ts: Date.now(), text: '（手动查询 task_id：' + tid + '）',
       voiceId: '', model: '', format: '',
       status: 'success', taskStatus: String(res.status || 'Processing'),
       taskId: tid, fileId: res.file_id != null ? String(res.file_id) : '',
+      subtitleFileId: subId,
       usage: 0, manual: true
     };
     upsertHistory(entry); renderHistory();
     renderAsyncResult(entry);
     if (entry.taskStatus === 'Success' && entry.fileId) await retrieveById(entry.id, { silent: true });
+    if (entry.taskStatus === 'Success' && entry.subtitleFileId) await retrieveSubtitle(entry.id, { silent: true });
     toast('查询完成：' + (TASK_STATUS[entry.taskStatus] || entry.taskStatus));
   } catch(err){ toast(err.message, 'error'); }
   finally { setManualBusy(false); }
@@ -1116,8 +1193,15 @@ function renderAsyncResult(entry){
       ${st === 'Success' && !entry.downloadUrl && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 获取下载链接</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>` : ''}
+      ${entry.subtitleFileId && !entry.subtitleUrl ? `<button class="btn" data-act="retrieveSub" data-id="${entry.id}">💬 获取字幕</button>` : ''}
+      ${entry.subtitleUrl || entry.subtitleCached ? `<button class="btn" data-act="downloadSub" data-id="${entry.id}">💬 下载字幕</button>` : ''}
       ${entry.taskId ? `<button class="btn" data-act="copytask" data-id="${entry.id}">📋 复制 task_id</button>` : ''}
-    </div>`;
+    </div>
+    ${entry.subtitleUrl || entry.subtitleCached ? `
+    <div class="sub-sec">
+      <div class="st">💬 字幕文件（时间戳精确到句）${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''}</div>
+      ${entry.subtitlePreview ? `<div class="subprev">${esc(entry.subtitlePreview)}</div>` : ''}
+    </div>` : ''}`;
   el.classList.add('show');
 }
 function renderAsyncResultIfActive(id){
@@ -1149,6 +1233,8 @@ function actsFor(e){
   if (e.status === 'failed') a.push(`<button class="btn btn-sm" data-act="redo" data-id="${e.id}">↻ 重新合成</button>`);
   if (e.mode === 'async' && e.taskId && (st === 'Processing' || !st)) a.push(`<button class="btn btn-sm" data-act="query" data-id="${e.id}">🔄 查询</button>`);
   if (st === 'Success' && !e.downloadUrl && e.fileId) a.push(`<button class="btn btn-sm" data-act="retrieve" data-id="${e.id}">🔗 获取链接</button>`);
+  if (e.subtitleFileId && !e.subtitleUrl) a.push(`<button class="btn btn-sm" data-act="retrieveSub" data-id="${e.id}">💬 取字幕</button>`);
+  if (e.subtitleUrl || e.subtitleCached) a.push(`<button class="btn btn-sm" data-act="downloadSub" data-id="${e.id}">💬 字幕</button>`);
   if (e.audioCached || e.downloadUrl){
     a.push(`<button class="btn btn-sm" data-act="play" data-id="${e.id}">▶ 播放</button>`);
     a.push(`<button class="btn btn-sm" data-act="download" data-id="${e.id}">⬇ 下载</button>`);
@@ -1168,6 +1254,7 @@ function historyItemHtml(e){
   if (ex && ex.size) meta.push(fmtBytes(ex.size));
   if (e.taskId) meta.push('task_id: <span class="mono">' + esc(e.taskId) + '</span>');
   if (e.fileId) meta.push('file_id: <span class="mono">' + esc(e.fileId) + '</span>');
+  if (e.subtitleFileId) meta.push('subtitle_id: <span class="mono">' + esc(e.subtitleFileId) + '</span>');
   if (e.audioCached) meta.push('🎧 已缓存');
   if (e.downloadUrl && e.urlExpiresAt && !e.audioCached && e.urlExpiresAt < Date.now()) meta.push('<span style="color:var(--err)">链接已过期，可尝试重新获取</span>');
   if (e.errMsg || e.lastErr) meta.push('<span style="color:var(--err)">' + esc((e.errMsg || e.lastErr).slice(0, 80)) + '</span>');
@@ -1218,6 +1305,7 @@ function syncFormFromSettings(){
   $('#outputFormat').value = settings.outputFormat || 'hex';
   $('#emotion').value = settings.emotion || '';
   $('#autoPoll').checked = settings.autoPoll !== false;
+  $('#subtitleEnable').checked = !!settings.subtitleEnable;
   $('#pollInterval').value = String(settings.pollInterval || 5000);
 }
 function syncSettingsFromForm(){
@@ -1230,6 +1318,7 @@ function syncSettingsFromForm(){
   settings.outputFormat = $('#outputFormat').value;
   settings.emotion = $('#emotion').value.trim();
   settings.autoPoll = $('#autoPoll').checked;
+  settings.subtitleEnable = $('#subtitleEnable').checked;
   settings.pollInterval = +$('#pollInterval').value;
   saveSettings();
   setupTicker();
@@ -1353,6 +1442,7 @@ function bindEvents(){
   $('#vol').addEventListener('input', () => $('#vVol').textContent = (+$('#vol').value).toFixed(1));
   $('#pitch').addEventListener('input', () => $('#vPitch').textContent = (+$('#pitch').value).toFixed(0));
   $('#autoPoll').addEventListener('change', syncSettingsFromForm);
+  $('#subtitleEnable').addEventListener('change', syncSettingsFromForm);
 
   // 音色拉取 / 试听
   $('#btnFetchVoices').addEventListener('click', fetchVoices);
@@ -1390,6 +1480,8 @@ function bindEvents(){
     else if (act === 'download') downloadEntry(id);
     else if (act === 'query') queryTaskById(id);
     else if (act === 'retrieve') retrieveById(id);
+    else if (act === 'retrieveSub') retrieveSubtitle(id);
+    else if (act === 'downloadSub') downloadSubtitle(id);
     else if (act === 'copytask'){
       const en = history.find(h => h.id === id);
       if (en && en.taskId) copyText(en.taskId);
@@ -1410,6 +1502,8 @@ function bindEvents(){
       else if (btn.dataset.act === 'download') downloadEntry(id);
       else if (btn.dataset.act === 'query') queryTaskById(id);
       else if (btn.dataset.act === 'retrieve') retrieveById(id);
+      else if (btn.dataset.act === 'retrieveSub') retrieveSubtitle(id);
+      else if (btn.dataset.act === 'downloadSub') downloadSubtitle(id);
       else if (btn.dataset.act === 'copytask'){
         const en = history.find(h => h.id === id);
         if (en && en.taskId) copyText(en.taskId);
