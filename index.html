@@ -85,6 +85,23 @@ main{
 .field input[type=range]{width:100%}
 .field input[type=checkbox]{vertical-align:-3px;margin-right:6px}
 .row{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text2)}
+.voice-row{display:flex;gap:8px}
+.voice-row input{flex:1}
+.voice-bank{margin:2px 0 10px;border:1px solid var(--border);border-radius:11px;padding:11px;background:var(--bg2)}
+.vb-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:9px}
+.vb-title{font-size:12.5px;color:var(--text2);font-weight:600}
+.vb-time{font-size:11.5px;color:var(--text3);flex:1;text-align:right}
+#voiceBankFilter{font-size:12px;padding:4px 9px;width:110px}
+.vb-groups{display:flex;flex-direction:column;gap:9px;max-height:180px;overflow-y:auto;padding-right:4px}
+.vb-groups::-webkit-scrollbar{width:8px}
+.vb-groups::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+.vb-gname{font-size:11.5px;color:var(--text3);margin-bottom:5px}
+.vb-n{color:var(--accent2)}
+.vb-chips{display:flex;flex-wrap:wrap;gap:6px}
+.vchip{font-size:12px;color:var(--text);background:var(--panel2);border:1px solid var(--border);border-radius:999px;padding:3px 11px;cursor:pointer;transition:.13s;max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vchip:hover{border-color:var(--accent);color:#fff}
+.vchip.on{background:var(--grad);border-color:transparent;color:#fff}
+.vb-empty{font-size:12px;color:var(--text3)}
 
 [data-only]{display:none}
 body[mode=async] [data-only=async]{display:block}
@@ -213,7 +230,10 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
     <div class="grid">
       <div class="field">
         <label>音色 Voice ID</label>
-        <input id="voiceId" list="voiceList" placeholder="选择或输入自定义音色 ID">
+        <div class="voice-row">
+          <input id="voiceId" list="voiceList" placeholder="选择或输入自定义音色 ID">
+          <button class="btn btn-sm" id="btnFetchVoices">🎤 拉取我的音色</button>
+        </div>
         <datalist id="voiceList">
           <option value="male-qn-qingse">青涩青年音色</option>
           <option value="male-qn-jingying">精英青年音色</option>
@@ -238,6 +258,15 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
           <option value="Chinese (Mandarin)_Warm_Girl">中文温暖女声</option>
           <option value="Chinese (Mandarin)_Clear_Boy">中文清亮男声</option>
         </datalist>
+      </div>
+      <div class="voice-bank" id="voiceBank" style="grid-column:1/-1;display:none">
+        <div class="vb-head">
+          <span class="vb-title">🎤 我账号下的音色（点击填入）</span>
+          <span class="vb-time" id="voiceBankTime"></span>
+          <input id="voiceBankFilter" placeholder="过滤音色…">
+          <button class="btn btn-sm" id="btnVoiceBankToggle">收起</button>
+        </div>
+        <div class="vb-groups" id="voiceBankGroups"></div>
       </div>
       <div class="field">
         <label>模型 Model</label>
@@ -491,6 +520,7 @@ function downloadBlob(blob, filename){
 /* ==================== 持久化：设置 / 历史 / 音频缓存 ==================== */
 const LS_SETTINGS = 'mm_tts_settings_v1';
 const LS_HISTORY  = 'mm_tts_history_v1';
+const LS_VOICES   = 'mm_tts_voices_v1';
 const DB_NAME = 'mm_tts_db', DB_STORE = 'audio';
 const MAX_HISTORY = 200;
 
@@ -615,6 +645,85 @@ async function fetchBlob(url){
   const res = await fetch(url);
   if (!res.ok) throw new Error('下载音频失败 HTTP ' + res.status);
   return await res.blob();
+}
+
+/* ==================== 音色拉取（官方 get_voice 接口） ==================== */
+const VOICE_GROUP_NAMES = { system_voice:'系统音色', voice_cloning:'复刻音色', voice_generation:'文生音色' };
+let voiceBank = loadJSON(LS_VOICES, { ts:0, groups:{ system_voice:[], voice_cloning:[], voice_generation:[] } });
+
+async function fetchVoices(){
+  const btn = $('#btnFetchVoices');
+  btn.disabled = true;
+  const old = btn.textContent;
+  btn.textContent = '拉取中…';
+  try {
+    const res = await apiCall('/v1/get_voice', { method:'POST', body:{ voice_type:'all' } });
+    const groups = {};
+    let total = 0;
+    for (const key of Object.keys(VOICE_GROUP_NAMES)){
+      const arr = Array.isArray(res[key]) ? res[key] : [];
+      groups[key] = arr.filter(v => v && v.voice_id).map(v => ({ id:String(v.voice_id), name:v.voice_name || String(v.voice_id) }));
+      total += groups[key].length;
+    }
+    if (!total) throw new Error('接口未返回任何音色（复刻/文生音色需成功合成过一次才会出现在列表中）');
+    voiceBank = { ts:Date.now(), groups };
+    try { localStorage.setItem(LS_VOICES, JSON.stringify(voiceBank)); } catch(e){}
+    renderVoiceBank(true);
+    toast('✅ 拉取到 ' + total + ' 个音色，已更新列表');
+  } catch(err){ toast(err.message, 'error'); }
+  finally { btn.disabled = false; btn.textContent = old; }
+}
+
+function renderVoiceBank(open){
+  const total = Object.values(voiceBank.groups).reduce((s, a) => s + a.length, 0);
+  const bank = $('#voiceBank');
+  if (!total){ bank.style.display = 'none'; return; }
+  if (open){ bank.style.display = ''; $('#btnVoiceBankToggle').textContent = '收起'; $('#voiceBankGroups').style.display = ''; }
+  $('#voiceBankTime').textContent = voiceBank.ts ? '更新于 ' + timeStr(voiceBank.ts) : '';
+
+  // 更新 datalist（以官方返回为准，替换内置预设）
+  const dl = $('#voiceList');
+  dl.innerHTML = '';
+  for (const [key, arr] of Object.entries(voiceBank.groups))
+    for (const v of arr){
+      const o = document.createElement('option');
+      o.value = v.id;
+      o.label = VOICE_GROUP_NAMES[key] + '｜' + v.name;
+      dl.appendChild(o);
+    }
+
+  // 渲染分组 chip
+  const f = $('#voiceBankFilter').value.trim().toLowerCase();
+  const box = $('#voiceBankGroups');
+  box.innerHTML = '';
+  let shown = 0;
+  for (const [key, arr] of Object.entries(voiceBank.groups)){
+    const list = arr.filter(v => !f || v.name.toLowerCase().includes(f) || v.id.toLowerCase().includes(f));
+    if (!list.length) continue;
+    shown += list.length;
+    const sec = document.createElement('div');
+    sec.className = 'vb-group';
+    sec.innerHTML = `<div class="vb-gname">${VOICE_GROUP_NAMES[key]} <span class="vb-n">${list.length}</span></div>`;
+    const chips = document.createElement('div');
+    chips.className = 'vb-chips';
+    for (const v of list){
+      const c = document.createElement('span');
+      c.className = 'vchip' + (v.id === $('#voiceId').value ? ' on' : '');
+      c.textContent = v.name;
+      c.title = v.id;
+      c.addEventListener('click', () => {
+        $('#voiceId').value = v.id;
+        settings.voiceId = v.id; saveSettings();
+        $$('.vchip', box).forEach(x => x.classList.remove('on'));
+        c.classList.add('on');
+        toast('已选择音色：' + v.name);
+      });
+      chips.appendChild(c);
+    }
+    sec.appendChild(chips);
+    box.appendChild(sec);
+  }
+  if (!shown) box.innerHTML = '<div class="vb-empty">没有匹配的音色</div>';
 }
 
 /* ==================== 请求体构造 ==================== */
@@ -1195,6 +1304,15 @@ function bindEvents(){
   $('#pitch').addEventListener('input', () => $('#vPitch').textContent = (+$('#pitch').value).toFixed(0));
   $('#autoPoll').addEventListener('change', syncSettingsFromForm);
 
+  // 音色拉取
+  $('#btnFetchVoices').addEventListener('click', fetchVoices);
+  $('#voiceBankFilter').addEventListener('input', () => renderVoiceBank());
+  $('#btnVoiceBankToggle').addEventListener('click', () => {
+    const g = $('#voiceBankGroups');
+    if (g.style.display === 'none'){ g.style.display = ''; $('#btnVoiceBankToggle').textContent = '收起'; }
+    else { g.style.display = 'none'; $('#btnVoiceBankToggle').textContent = '展开'; }
+  });
+
   // 提交
   $('#submitBtn').addEventListener('click', () => {
     if (document.body.getAttribute('mode') === 'async') runAsyncCreate(); else runSync();
@@ -1287,6 +1405,7 @@ importFileInput.addEventListener('change', e => {
 document.body.appendChild(importFileInput);
 
 syncFormFromSettings();
+renderVoiceBank(); // 之前拉取过的音色列表会随页面自动恢复
 renderHistory();
 setupTicker(); // 页面刷新后自动续查「处理中」的异步任务
 bindEvents();
