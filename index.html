@@ -383,20 +383,6 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         <input id="emotion" placeholder="如 happy / sad / angry…">
       </div>
       <div class="field" data-only="async">
-        <label>自动轮询</label>
-        <div class="row">
-          <input type="checkbox" id="autoPoll" checked>
-          <span>创建后自动查询直至完成</span>
-        </div>
-      </div>
-      <div class="field" data-only="async">
-        <label>字幕</label>
-        <div class="row">
-          <input type="checkbox" id="subtitleEnable">
-          <span>生成字幕文件（时间戳精确到句）</span>
-        </div>
-      </div>
-      <div class="field" data-only="async">
         <label>文本输入方式</label>
         <div class="row">
           <input type="checkbox" id="useTextFile">
@@ -415,6 +401,7 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
       <div class="field" data-only="async">
         <label>轮询间隔</label>
         <select id="pollInterval">
+          <option value="0">不轮询（手动查询）</option>
           <option value="3000">3 秒</option>
           <option value="5000" selected>5 秒</option>
           <option value="10000">10 秒</option>
@@ -503,6 +490,13 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
     <div class="field">
       <label>CORS 代理前缀（可选）</label>
       <input id="setProxy" placeholder="如 https://my-cors-proxy.example/ — 仅当浏览器直连被 CORS 拦截时填写，且请务必使用自己信任的代理">
+    </div>
+    <div class="field">
+      <label>文件保存方式</label>
+      <select id="setSaveMethod">
+        <option value="picker">另存为对话框（无网络锁定标记，推荐）</option>
+        <option value="classic">浏览器传统下载</option>
+      </select>
     </div>
     <div class="note">
       ⚠️ 说明：所有请求均从浏览器直接发起。若提示网络/CORS 错误，可配置自己的代理前缀，或使用本地代理（如 <code>http://localhost:8080/</code>）转发到 MiniMax。API Key 只保存在本机 localStorage，请勿在不可信设备上使用。
@@ -647,6 +641,26 @@ function downloadBlob(blob, filename){
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 10000);
 }
 
+// 优先用「另存为」对话框保存：文件由浏览器本地写入，不带网络区域标记（Zone.Identifier），
+// 打开时不会被 Windows 安全设置阻止。不支持时回退传统下载。
+// 返回 'picker' | 'classic' | 'cancelled'
+async function saveBlob(blob, filename){
+  if (settings.saveMethod !== 'classic' && typeof window.showSaveFilePicker === 'function'){
+    try {
+      const handle = await window.showSaveFilePicker({ suggestedName: filename, id: 'minimax-tts-save' });
+      const w = await handle.createWritable();
+      await w.write(blob);
+      await w.close();
+      return 'picker';
+    } catch(err){
+      if (err && err.name === 'AbortError') return 'cancelled';
+      // 其他异常（如非安全上下文、超时）回退传统下载
+    }
+  }
+  downloadBlob(blob, filename);
+  return 'classic';
+}
+
 /* ==================== 持久化：设置 / 历史 / 音频缓存 ==================== */
 const LS_SETTINGS = 'mm_tts_settings_v1';
 const LS_HISTORY  = 'mm_tts_history_v1';
@@ -667,9 +681,9 @@ let settings = loadJSON(LS_SETTINGS, {
   speed:1, vol:1, pitch:0,
   sampleRate:32000, bitrate:128000, format:'mp3', channel:1,
   languageBoost:'', outputFormat:'hex', emotion:'',
-  subtitleEnable:false,
   useTextFile:false, textFileId:'', textFileName:'', textFileTs:0,
-  autoPoll:true, pollInterval:5000
+  saveMethod:'picker',
+  pollInterval:5000
 });
 function saveSettings(){ try { localStorage.setItem(LS_SETTINGS, JSON.stringify(settings)); } catch(e){ toast('设置保存失败：' + e.message, 'error'); } }
 
@@ -935,10 +949,10 @@ function buildCommonBody(text, isAsync){
   if (!isAsync){
     b.text = text;
     b.stream = false;
+    b.subtitle_enable = true; // 同步接口：开启后响应 data.subtitle_file 返回字幕链接
   } else {
     if (settings.useTextFile && settings.textFileId) b.text_file_id = settings.textFileId;
     else b.text = text;
-    if (settings.subtitleEnable) b.subtitle_enable = true;
   }
   if (settings.languageBoost) b.language_boost = settings.languageBoost;
   return b;
@@ -981,6 +995,22 @@ async function runSync(){
         audioFormat: extra.audio_format || ''
       }
     };
+    // 字幕：subtitle_enable=true 时响应 data.subtitle_file 为字幕下载链接
+    const subUrl = d.subtitle_file;
+    if (subUrl && typeof subUrl === 'string' && /^https?:/i.test(subUrl)){
+      entry.subtitleUrl = subUrl;
+      entry.subtitleFileName = subUrl.split('/').pop().split('?')[0] || 'subtitle.json';
+      let sblob = null;
+      try { sblob = await fetchBlob(subUrl); }
+      catch(err){
+        try { sblob = await (await fetch(subUrl, { headers:{ 'Authorization':'Bearer ' + settings.apiKey } })).blob(); } catch(err2){}
+      }
+      if (sblob){
+        await idbPut('sub:' + entry.id, sblob);
+        entry.subtitleCached = true;
+        try { entry.subtitlePreview = buildSubtitlePreview(await sblob.text()); } catch(_){}
+      }
+    }
     await idbPut(entry.id, blob);
     upsertHistory(entry);
     renderHistory();
@@ -1029,8 +1059,12 @@ async function runAsyncCreate(){
     upsertHistory(entry);
     renderHistory();
     renderAsyncResult(entry);
-    toast('📦 任务已创建：' + entry.taskId + '，开始轮询…');
-    await queryTaskById(entry.id, { silent: true });
+    if (+settings.pollInterval > 0){
+      toast('📦 任务已创建：' + entry.taskId + '，开始轮询…');
+      await queryTaskById(entry.id, { silent: true });
+    } else {
+      toast('📦 任务已创建：' + entry.taskId + '（未开启轮询，可手动点「查询」）');
+    }
   } catch(err){
     addFailedEntry('async', text, err.message);
     toast(err.message, 'error');
@@ -1225,12 +1259,12 @@ async function downloadSubtitle(id, silent){
     // 默认转换为标准 SRT（UTF-8 带 BOM，兼容主流播放器）；无法解析时回退为原格式
     const srt = titlesToSrt(await blob.text().catch(() => ''));
     if (srt){
-      downloadBlob(new Blob(['﻿' + srt], { type:'text/plain;charset=utf-8' }), entryAudioBase(e) + '.srt');
-      if (!silent) toast('✅ 已下载标准 SRT 字幕');
+      const method = await saveBlob(new Blob(['﻿' + srt], { type:'text/plain;charset=utf-8' }), entryAudioBase(e) + '.srt');
+      if (!silent) toast(method === 'picker' ? '✅ 已保存标准 SRT 字幕（无网络标记）' : (method === 'cancelled' ? '已取消保存' : '✅ 已下载标准 SRT 字幕'));
     } else {
       const ext = ((e.subtitleFileName || '').match(/\.([a-z0-9]+)$/i) || [,'json'])[1].toLowerCase();
-      downloadBlob(blob, entryAudioBase(e) + '.' + ext);
-      if (!silent) toast('⚠️ 内容不是 .titles JSON，已按原格式下载');
+      const method = await saveBlob(blob, entryAudioBase(e) + '.' + ext);
+      if (!silent) toast(method === 'picker' ? '已保存原格式字幕（无网络标记）' : (method === 'cancelled' ? '已取消保存' : '⚠️ 内容不是 .titles JSON，已按原格式下载'));
     }
   }
   else if (e.subtitleUrl) window.open(e.subtitleUrl, '_blank');
@@ -1247,7 +1281,8 @@ async function downloadSubtitleRaw(id){
   }
   if (blob){
     const ext = ((e.subtitleFileName || '').match(/\.([a-z0-9]+)$/i) || [,'json'])[1].toLowerCase();
-    downloadBlob(blob, entryAudioBase(e) + '.' + ext);
+    const method = await saveBlob(blob, entryAudioBase(e) + '.' + ext);
+    if (method === 'picker') toast('✅ 已保存原文件（无网络标记）');
   }
   else if (e.subtitleUrl) window.open(e.subtitleUrl, '_blank');
   else toast('没有可下载的字幕', 'error');
@@ -1282,15 +1317,17 @@ async function downloadExtra(id, idx){
     catch(err){ window.open(x.url, '_blank'); toast('无法内嵌下载，已在新标签页打开', 'warn'); return; }
   }
   if (!blob) return toast('该文件无下载链接：' + (x.error || ''), 'error');
-  downloadBlob(blob, x.filename || ('minimax_extra_' + idx + '_' + fileTs(e.ts)));
+  const method = await saveBlob(blob, x.filename || ('minimax_extra_' + idx + '_' + fileTs(e.ts)));
+  if (method === 'picker') toast('✅ 已保存（无网络标记）');
 }
 
 /* ---- 轮询 ---- */
 let tickTimer = null, ticking = false;
 function setupTicker(){
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
-  if (!settings.autoPoll) return;
-  tickTimer = setInterval(tick, Math.max(3000, +settings.pollInterval || 5000));
+  const iv = +settings.pollInterval || 0;
+  if (iv <= 0) return; // 不轮询：仅手动查询
+  tickTimer = setInterval(tick, Math.max(3000, iv));
 }
 async function tick(){
   if (ticking) return;
@@ -1379,8 +1416,9 @@ async function splitToZipDownload(){
   const chapters = splitChapters(content, 90000);
   const enc = new TextEncoder();
   const zip = buildZip(chapters.map((ch, i) => ({ name:'chapter_' + (i + 1).toString().padStart(3, '0') + '.txt', data: enc.encode(ch) })));
-  downloadBlob(zip, 'chapters_' + chapters.length + '.zip');
-  toast('✅ 已生成 zip：' + chapters.length + ' 个章节，每章 <9 万字符；选择该 zip 上传即可');
+  const method = await saveBlob(zip, 'chapters_' + chapters.length + '.zip');
+  if (method === 'picker') toast('✅ 已保存 zip（无网络标记）：' + chapters.length + ' 个章节，每章 <9 万字符');
+  else if (method === 'classic') toast('✅ 已生成 zip：' + chapters.length + ' 个章节，每章 <9 万字符；选择该 zip 上传即可');
 }
 
 /* ---- 文本文件上传（text_file_id） ---- */
@@ -1519,8 +1557,14 @@ function parseSubtitle(text){
     const arr = JSON.parse(text);
     if (Array.isArray(arr)){
       return arr
-        .filter(s => s && s.text != null && s.time_begin != null)
-        .map(s => ({ text: String(s.text), begin: +s.time_begin, end: (s.time_end != null ? +s.time_end : +s.time_begin + 2000) }));
+        .filter(s => s && typeof s === 'object')
+        .map(s => {
+          // 兼容 .titles（time_begin/time_end）与通用格式（start/end 等别名）
+          const begin = s.time_begin ?? s.start_time ?? s.start ?? s.begin ?? s.begin_time;
+          const end = s.time_end ?? s.end_time ?? s.end ?? s.finish ?? (begin != null ? +begin + 2000 : null);
+          return { text: String(s.text ?? s.subtitle_text ?? s.content ?? ''), begin: +begin, end: +end };
+        })
+        .filter(s => s.text && !isNaN(s.begin));
     }
   } catch(e){}
   return [];
@@ -1598,12 +1642,13 @@ async function downloadEntry(id){
   }
   if (blob){
     const ext = ((e.fileName || '').match(/\.([a-z0-9]+)$/i) || [, e.format || 'mp3'])[1].toLowerCase();
-    downloadBlob(blob, entryAudioBase(e) + '.' + ext);
+    const method = await saveBlob(blob, entryAudioBase(e) + '.' + ext);
+    if (method === 'cancelled') return;
     if (e.subtitleCached || e.subtitleUrl){
-      setTimeout(() => downloadSubtitle(id, true), 500); // 音频 + 同名 SRT 一起下载
-      toast('已开始下载音频，同名 SRT 字幕将随后下载');
+      setTimeout(() => downloadSubtitle(id, true), 400); // 音频 + 同名 SRT 一起保存
+      toast(method === 'picker' ? '音频已保存（无网络标记），即将弹出字幕保存框' : '已开始下载音频，同名 SRT 字幕将随后下载');
     } else {
-      toast('已开始下载');
+      toast(method === 'picker' ? '✅ 音频已保存（无网络标记）' : '已开始下载');
     }
   } else if (e.downloadUrl){
     window.open(e.downloadUrl, '_blank');
@@ -1630,7 +1675,14 @@ function renderSyncResult(entry){
     <div class="acts">
       <button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>
       <button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>
-    </div>`;
+    </div>
+    ${entry.subtitleUrl || entry.subtitleCached ? `
+    <div class="sub-sec">
+      <div class="st">💬 字幕文件${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''} · 播放时同步显示，点「⬇ 下载」随音频一并下载同名 SRT</div>
+      <div class="acts">
+        <button class="btn btn-sm" data-act="downloadSubRaw" data-id="${entry.id}">原文件</button>
+      </div>
+    </div>` : ''}`;
   el.classList.add('show');
 }
 
@@ -1782,10 +1834,8 @@ function syncFormFromSettings(){
   $('#languageBoost').value = settings.languageBoost || '';
   $('#outputFormat').value = settings.outputFormat || 'hex';
   $('#emotion').value = settings.emotion || '';
-  $('#autoPoll').checked = settings.autoPoll !== false;
-  $('#subtitleEnable').checked = !!settings.subtitleEnable;
   $('#useTextFile').checked = !!settings.useTextFile;
-  $('#pollInterval').value = String(settings.pollInterval || 5000);
+  $('#pollInterval').value = String(settings.pollInterval == null ? 5000 : settings.pollInterval);
   updateFileModeUI();
 }
 function syncSettingsFromForm(){
@@ -1797,8 +1847,6 @@ function syncSettingsFromForm(){
   settings.languageBoost = $('#languageBoost').value;
   settings.outputFormat = $('#outputFormat').value;
   settings.emotion = $('#emotion').value.trim();
-  settings.autoPoll = $('#autoPoll').checked;
-  settings.subtitleEnable = $('#subtitleEnable').checked;
   settings.useTextFile = $('#useTextFile').checked;
   settings.pollInterval = +$('#pollInterval').value;
   saveSettings();
@@ -1858,6 +1906,7 @@ function openSettings(){
   $('#customBaseWrap').style.display = isCustom ? '' : 'none';
   $('#setGroupId').value = settings.groupId || '';
   $('#setProxy').value = settings.proxy || '';
+  $('#setSaveMethod').value = settings.saveMethod || 'picker';
   $('#setOverlay').classList.add('show');
 }
 function applySettingsModal(){
@@ -1867,6 +1916,7 @@ function applySettingsModal(){
   settings.baseUrl = base === '__custom__' ? (settings.customBase || '') : base;
   settings.groupId = $('#setGroupId').value.trim();
   settings.proxy = $('#setProxy').value.trim();
+  settings.saveMethod = $('#setSaveMethod').value;
   saveSettings();
   toast('✅ 设置已保存');
   $('#setOverlay').classList.remove('show');
@@ -1922,8 +1972,6 @@ function bindEvents(){
   $('#speed').addEventListener('input', () => $('#vSpeed').textContent = (+$('#speed').value).toFixed(1));
   $('#vol').addEventListener('input', () => $('#vVol').textContent = (+$('#vol').value).toFixed(1));
   $('#pitch').addEventListener('input', () => $('#vPitch').textContent = (+$('#pitch').value).toFixed(0));
-  $('#autoPoll').addEventListener('change', syncSettingsFromForm);
-  $('#subtitleEnable').addEventListener('change', syncSettingsFromForm);
 
   // 音色拉取 / 试听
   $('#btnFetchVoices').addEventListener('click', fetchVoices);
