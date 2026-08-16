@@ -118,6 +118,12 @@ main{
 .exf-row{display:flex;gap:8px;align-items:center;margin-bottom:5px;font-size:12px;color:var(--text2)}
 .exf-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .exf-err{color:var(--err);font-size:11.5px}
+.exf-size{font-size:11px;color:var(--text3);flex:none}
+.raw-acts{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.raw-hint{font-size:11.5px;color:var(--text3);flex:1;min-width:150px}
+.raw-sec{margin-bottom:12px}
+.raw-sec .rk{font-size:12px;color:var(--accent2);margin-bottom:4px}
+.raw-pre{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:10px;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)}
 
 [data-only]{display:none}
 body[mode=async] [data-only=async]{display:block}
@@ -180,6 +186,11 @@ body[mode=async] [data-only=async].row{display:flex}
 .hitem .h-text{font-size:12.5px;color:var(--text2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
 .hitem .h-meta{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:11.5px;color:var(--text3);margin-top:7px}
 .hitem .h-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:9px}
+.h-sub{font-size:12px;color:var(--text2);margin-top:7px}
+.h-sub summary{cursor:pointer;color:var(--accent2);font-size:12px;user-select:none;list-style:none}
+.h-sub summary::-webkit-details-marker{display:none}
+.h-sub summary::before{content:'▸ '}
+.h-sub[open] summary::before{content:'▾ '}
 .empty{text-align:center;color:var(--text3);padding:36px 10px;font-size:13px}
 .empty .big{font-size:30px;display:block;margin-bottom:8px;opacity:.5}
 
@@ -502,6 +513,19 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
   </div>
 </div>
 
+<!-- 原始响应弹层 -->
+<div class="overlay" id="rawOverlay">
+  <div class="modal" style="width:min(760px,100%)">
+    <h3>🔍 原始响应</h3>
+    <div class="raw-acts">
+      <button class="btn btn-sm" id="btnCopyRaw">📋 复制全部</button>
+      <span class="raw-hint">若字幕未出现，复制「查询状态」的 JSON 即可定位字幕字段名</span>
+    </div>
+    <div id="rawContent"></div>
+    <div class="m-acts"><button class="btn" id="btnRawClose">关闭</button></div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -536,6 +560,80 @@ async function copyText(t){
     document.execCommand('copy'); ta.remove();
   }
   toast('已复制到剪贴板');
+}
+
+function storeRaw(entry, kind, res){
+  try {
+    const s = JSON.stringify(res);
+    const cap = 8000;
+    if (!entry.raws) entry.raws = {};
+    entry.raws[kind] = { json: s.length > cap ? s.slice(0, cap) : s, truncated: s.length > cap, ts: Date.now() };
+  } catch(e){}
+}
+
+/* ---- tar 归档解析（ustar 格式，用于解包音频+字幕打包结果） ---- */
+function parseTar(buf){
+  const dv = new DataView(buf);
+  const dec = new TextDecoder();
+  const out = [];
+  let off = 0, longName = null;
+  const readStr = (o, len) => {
+    const bytes = new Uint8Array(buf, o, len);
+    let end = 0;
+    while (end < len && bytes[end] !== 0) end++;
+    return dec.decode(bytes.subarray(0, end));
+  };
+  const isZeroBlock = o => {
+    for (let i = o; i < o + 512; i++) if (dv.getUint8(i) !== 0) return false;
+    return true;
+  };
+  while (off + 512 <= buf.byteLength){
+    if (isZeroBlock(off)) break;
+    const name = readStr(off, 100);
+    const size = parseInt(readStr(off + 124, 12).trim() || '0', 8) || 0;
+    const type = readStr(off + 156, 1);
+    const prefix = readStr(off + 345, 155);
+    const dataOff = off + 512;
+    const data = new Uint8Array(buf, dataOff, size);
+    if (type === 'L'){ longName = dec.decode(data); }
+    else {
+      const full = longName || (prefix ? prefix + '/' + name : name);
+      if (full && (type === '0' || type === '')) out.push({ name: full, size, data });
+      longName = null;
+    }
+    off = dataOff + Math.ceil(size / 512) * 512;
+  }
+  return out;
+}
+
+async function looksLikeTar(blob){
+  try {
+    const head = new Uint8Array(await blob.slice(0, 512).arrayBuffer());
+    // ustar 魔数位于偏移 257
+    return head.length === 512 && head[257] === 0x75 && head[258] === 0x73 && head[259] === 0x74 && head[260] === 0x61 && head[261] === 0x72;
+  } catch(e){ return false; }
+}
+
+function isSubtitleName(name){
+  name = String(name || '');
+  return /subtitle/i.test(name) || /\.(srt|vtt|titles)$/i.test(name) || (/\.json$/i.test(name) && !/extra/i.test(name));
+}
+
+function baseName(n){ return String(n || '').split('/').pop(); }
+
+function fmtTs(ms){
+  ms = Math.round(+ms || 0);
+  const m = Math.floor(ms / 60000), s = Math.floor(ms % 60000 / 1000), mm = ms % 1000;
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') + '.' + String(mm).padStart(3, '0');
+}
+
+// .titles 内容为 JSON 数组（text + 毫秒时间戳），按时间轴渲染预览
+function buildSubtitlePreview(text){
+  try {
+    const arr = JSON.parse(text);
+    if (!Array.isArray(arr)) throw 0;
+    return arr.slice(0, 50).map((s, i) => (i + 1) + ' | ' + fmtTs(s.time_begin) + ' → ' + fmtTs(s.time_end) + ' | ' + String(s.text ?? '')).join('\n');
+  } catch(e){ return String(text).slice(0, 400); }
 }
 
 function hexToBytes(hex){
@@ -586,7 +684,14 @@ function saveSettings(){ try { localStorage.setItem(LS_SETTINGS, JSON.stringify(
 let history = loadJSON(LS_HISTORY, []);
 function saveHistory(){
   try { localStorage.setItem(LS_HISTORY, JSON.stringify(history)); }
-  catch(e){ toast('历史记录保存失败（存储可能已满）', 'error'); }
+  catch(e){
+    // 存储超限：从最旧记录开始剥离原始响应数据，重试一次
+    for (let i = history.length - 1; i >= 0; i--) delete history[i].raws;
+    try {
+      localStorage.setItem(LS_HISTORY, JSON.stringify(history));
+      toast('存储空间不足，已清理历史中的原始响应数据', 'warn');
+    } catch(e2){ toast('历史记录保存失败（存储可能已满）', 'error'); }
+  }
 }
 function pruneHistory(){
   if (history.length <= MAX_HISTORY) return;
@@ -599,8 +704,13 @@ function upsertHistory(entry){
   pruneHistory(); saveHistory();
 }
 function delHistory(id){
+  const e = history.find(h => h.id === id);
   history = history.filter(h => h.id !== id);
-  idbDel(id); saveHistory();
+  idbDel(id);
+  idbDel('sub:' + id);
+  const n = (e && e.extraFiles) ? e.extraFiles.length : 0;
+  for (let i = 0; i < n; i++) idbDel('exf:' + id + ':' + i);
+  saveHistory();
 }
 
 /* ---- IndexedDB 音频缓存 ---- */
@@ -924,6 +1034,7 @@ async function runAsyncCreate(){
       fileId: res.file_id != null ? String(res.file_id) : '',
       usage: res.usage_characters || 0
     };
+    storeRaw(entry, '创建任务', res);
     upsertHistory(entry);
     renderHistory();
     renderAsyncResult(entry);
@@ -942,6 +1053,7 @@ async function queryTaskById(id, { silent=false } = {}){
   querying.add(id);
   try {
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(entry.taskId));
+    storeRaw(entry, '查询状态', res);
     entry.taskStatus = String(res.status || entry.taskStatus || 'Processing');
     if (Array.isArray(res.file_id)){ // zip 多章节可能一次返回多个文件 ID
       const ids = res.file_id.map(String);
@@ -975,38 +1087,102 @@ async function retrieveById(id, { silent=false } = {}){
   if (!entry || !entry.fileId) return;
   try {
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.fileId));
+    storeRaw(entry, '检索文件', res);
     const files = Array.isArray(res.file) ? res.file : [res.file].filter(Boolean);
     const f = files.find(x => !/subtitle/i.test(String(x.filename || '')) && !/\.json$/i.test(String(x.filename || ''))) || files[0];
     if (!f || !f.download_url) throw new Error('未获取到下载链接');
     entry.downloadUrl = f.download_url;
     entry.fileName = f.filename || '';
-    // 部分版本下 files/retrieve 会一次性返回音频 + 字幕等多个文件
-    const subFile = files.find(x => x !== f && (/subtitle/i.test(String(x.filename || '')) || /\.json$/i.test(String(x.filename || ''))));
-    if (subFile && subFile.download_url){
-      entry.subtitleUrl = subFile.download_url;
-      entry.subtitleFileName = subFile.filename || '';
-      try {
-        const sblob = await fetchBlob(entry.subtitleUrl);
-        await idbPut('sub:' + entry.id, sblob);
-        entry.subtitleCached = true;
-        try { entry.subtitlePreview = (await sblob.text()).slice(0, 400); } catch(_){}
-      } catch(e){}
-    }
-    // 其余文件（如 zip 多章节的多个音频）作为附加文件保存
-    const extras = files.filter(x => x !== f && x !== subFile).map(x => ({ fileId:'', url:x.download_url || '', filename:x.filename || '' }));
-    if (extras.length) entry.extraFiles = entry.extraFiles ? entry.extraFiles.concat(extras) : extras;
     entry.urlExpiresAt = Date.now() + 9 * 3600 * 1000; // 官方文档：9 小时有效
     upsertHistory(entry);
     renderHistory();
     renderAsyncResultIfActive(id);
-    // 尝试把音频缓存到本地（IndexedDB），失败则仍可通过链接打开
+    // 尝试把结果缓存到本地；若为 tar 归档（音频+字幕打包，如 xxx_with_meta.tar），自动解包
     try {
       const blob = await fetchBlob(entry.downloadUrl);
-      await idbPut(entry.id, blob);
-      entry.audioCached = true;
-      upsertHistory(entry); renderHistory();
+      const isTar = /\.tar(\.gz)?$/i.test(String(entry.fileName || '')) || await looksLikeTar(blob);
+      if (isTar){
+        const tarFiles = parseTar(await blob.arrayBuffer());
+        if (!tarFiles.length) throw new Error('tar 归档解析结果为空');
+        entry.tarEntries = tarFiles.map(x => ({ name:x.name, size:x.size }));
+        // 音频：按扩展名识别，取第一个命中者
+        const audioE = tarFiles.find(x => /\.(mp3|wav|flac|aac|pcm|ogg)$/i.test(x.name)) || tarFiles[0];
+        const aext = (audioE.name.match(/\.([a-z0-9]+)$/i) || [,'mp3'])[1].toLowerCase();
+        await idbPut(entry.id, new Blob([audioE.data], { type: MIME[aext] || 'application/octet-stream' }));
+        entry.audioCached = true;
+        entry.fileName = baseName(audioE.name);
+        // 字幕：.titles / subtitle / srt / vtt / json（排除 extra 信息文件）
+        const subE = tarFiles.find(x => x !== audioE && isSubtitleName(x.name));
+        if (subE){
+          const subBlob = new Blob([subE.data]);
+          await idbPut('sub:' + entry.id, subBlob);
+          entry.subtitleCached = true;
+          entry.subtitleFileName = baseName(subE.name);
+          try { entry.subtitlePreview = buildSubtitlePreview(await subBlob.text()); } catch(_){}
+        }
+        // .extra 附加信息：解析出时长/采样率/大小等合并进元数据
+        const extraE = tarFiles.find(x => x !== audioE && x !== subE && /\.extra$/i.test(x.name));
+        if (extraE){
+          try {
+            const ex = JSON.parse(new TextDecoder().decode(extraE.data));
+            entry.extra = {
+              durationMs: ex.audio_length || 0,
+              sampleRate: ex.audio_sample_rate || '',
+              size: ex.audio_size || 0,
+              usage: entry.usage || ex.word_count || 0,
+              audioFormat: settings.format || ''
+            };
+          } catch(_){}
+        }
+        // 其余文件 → 附件（本地缓存）
+        const rest = tarFiles.filter(x => x !== audioE && x !== subE);
+        const exfs = [];
+        for (let i = 0; i < rest.length; i++){
+          await idbPut('exf:' + entry.id + ':' + i, new Blob([rest[i].data]));
+          exfs.push({ fileId:'', url:'', filename:baseName(rest[i].name), cached:true, idx:i, size:rest[i].size });
+        }
+        if (exfs.length) entry.extraFiles = exfs;
+      } else {
+        await idbPut(entry.id, blob);
+        entry.audioCached = true;
+      }
+      upsertHistory(entry); renderHistory(); renderAsyncResultIfActive(id);
     } catch(e){}
-    if (!silent) toast('✅ 已获取下载链接');
+    // 兼容：检索响应直接给出字幕对象 / 链接
+    if (!entry.subtitleUrl && !entry.subtitleCached){
+      const so = res.subtitle_file || res.subtitle || (res.extra_info && res.extra_info.subtitle_file);
+      const su = so && (so.download_url || so.url || (so.file && (so.file.download_url || so.file.url)));
+      if (su){
+        entry.subtitleUrl = su;
+        entry.subtitleFileName = so.filename || '';
+        try {
+          const sblob = await fetchBlob(su);
+          await idbPut('sub:' + entry.id, sblob);
+          entry.subtitleCached = true;
+          try { entry.subtitlePreview = buildSubtitlePreview(await sblob.text()); } catch(_){}
+        } catch(e){}
+        upsertHistory(entry); renderHistory();
+      }
+    }
+    // 兼容：files/retrieve 返回多文件时，按文件名识别字幕（.titles/.srt/.vtt/含 subtitle 的 json）
+    if (!entry.subtitleUrl && !entry.subtitleCached){
+      const subFile = files.find(x => x !== f && isSubtitleName(String(x.filename || '')));
+      if (subFile && subFile.download_url){
+        entry.subtitleUrl = subFile.download_url;
+        entry.subtitleFileName = subFile.filename || '';
+        try {
+          const sblob = await fetchBlob(entry.subtitleUrl);
+          await idbPut('sub:' + entry.id, sblob);
+          entry.subtitleCached = true;
+          try { entry.subtitlePreview = buildSubtitlePreview(await sblob.text()); } catch(_){}
+        } catch(e){}
+        upsertHistory(entry); renderHistory();
+      }
+    }
+    // 其余文件（如 zip 多章节的多个音频）作为附加文件保存
+    const extras = files.filter(x => x !== f && !isSubtitleName(String(x.filename || ''))).map(x => ({ fileId:'', url:x.download_url || '', filename:x.filename || '' }));
+    if (extras.length) entry.extraFiles = entry.extraFiles ? entry.extraFiles.concat(extras) : extras;
+    if (!silent) toast('✅ 已获取下载链接' + (entry.tarEntries ? '，并解包归档（音频+字幕）' : ''));
     return entry;
   } catch(err){
     if (!silent) toast(err.message, 'error');
@@ -1017,8 +1193,9 @@ async function retrieveById(id, { silent=false } = {}){
 /* ---- 字幕 ---- */
 function pickSubtitleId(res){
   const v = res.subtitle_file_id ?? res.subtitle_file ?? res.subtitle_id
-    ?? (res.extra_info && (res.extra_info.subtitle_file_id || res.extra_info.subtitle_file || res.extra_info.subtitle_id));
-  return v != null ? String(v) : '';
+    ?? (res.subtitle && (res.subtitle.file_id ?? res.subtitle.id))
+    ?? (res.extra_info && (res.extra_info.subtitle_file_id || res.extra_info.subtitle_file || res.extra_info.subtitle_id || res.extra_info.subtitle));
+  return (v != null && v !== 0 && v !== '') ? String(v) : '';
 }
 
 async function retrieveSubtitle(id, { silent=false } = {}){
@@ -1026,6 +1203,7 @@ async function retrieveSubtitle(id, { silent=false } = {}){
   if (!entry || !entry.subtitleFileId) return;
   try {
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.subtitleFileId));
+    storeRaw(entry, '检索字幕', res);
     const f = Array.isArray(res.file) ? res.file[0] : res.file;
     if (!f || !f.download_url) throw new Error('未获取到字幕下载链接');
     entry.subtitleUrl = f.download_url;
@@ -1034,7 +1212,7 @@ async function retrieveSubtitle(id, { silent=false } = {}){
       const blob = await fetchBlob(entry.subtitleUrl);
       await idbPut('sub:' + entry.id, blob);
       entry.subtitleCached = true;
-      try { entry.subtitlePreview = (await blob.text()).slice(0, 400); } catch(_){}
+      try { entry.subtitlePreview = buildSubtitlePreview(await blob.text()); } catch(_){}
     } catch(e){}
     upsertHistory(entry);
     renderHistory();
@@ -1055,7 +1233,10 @@ async function downloadSubtitle(id){
       e.subtitleCached = true; upsertHistory(e);
     } catch(_){}
   }
-  if (blob) downloadBlob(blob, 'minimax_subtitle_' + fileTs(e.ts) + '.json');
+  if (blob){
+    const ext = ((e.subtitleFileName || '').match(/\.([a-z0-9]+)$/i) || [,'json'])[1].toLowerCase();
+    downloadBlob(blob, 'minimax_subtitle_' + fileTs(e.ts) + '.' + ext);
+  }
   else if (e.subtitleUrl) window.open(e.subtitleUrl, '_blank');
   else toast('没有可下载的字幕', 'error');
 }
@@ -1082,14 +1263,14 @@ async function downloadExtra(id, idx){
   const e = history.find(h => h.id === id);
   if (!e || !e.extraFiles || !e.extraFiles[idx]) return;
   const x = e.extraFiles[idx];
-  if (!x.url) return toast('该文件无下载链接：' + (x.error || ''), 'error');
-  try {
-    const blob = await fetchBlob(x.url);
-    downloadBlob(blob, x.filename || ('minimax_extra_' + idx + '_' + fileTs(e.ts)));
-  } catch(err){
-    window.open(x.url, '_blank');
-    toast('无法内嵌下载，已在新标签页打开', 'warn');
+  let blob = null;
+  if (x.cached){ try { blob = await idbGet('exf:' + id + ':' + (x.idx != null ? x.idx : idx)); } catch(_){} }
+  if (!blob && x.url){
+    try { blob = await fetchBlob(x.url); }
+    catch(err){ window.open(x.url, '_blank'); toast('无法内嵌下载，已在新标签页打开', 'warn'); return; }
   }
+  if (!blob) return toast('该文件无下载链接：' + (x.error || ''), 'error');
+  downloadBlob(blob, x.filename || ('minimax_extra_' + idx + '_' + fileTs(e.ts)));
 }
 
 /* ---- 轮询 ---- */
@@ -1352,7 +1533,8 @@ async function downloadEntry(id){
     } catch(_){}
   }
   if (blob){
-    downloadBlob(blob, 'minimax_' + e.mode + '_' + fileTs(e.ts) + '.' + (e.format || 'mp3'));
+    const ext = ((e.fileName || '').match(/\.([a-z0-9]+)$/i) || [, e.format || 'mp3'])[1].toLowerCase();
+    downloadBlob(blob, 'minimax_' + e.mode + '_' + fileTs(e.ts) + '.' + ext);
     toast('已开始下载');
   } else if (e.downloadUrl){
     window.open(e.downloadUrl, '_blank');
@@ -1398,6 +1580,9 @@ function renderAsyncResult(entry){
       ${entry.taskId ? `<span>task_id：<span class="mono">${esc(entry.taskId)}</span></span>` : ''}
       ${entry.fileId ? `<span>file_id：<span class="mono">${esc(entry.fileId)}</span></span>` : ''}
       ${entry.usage ? `<span>计费：<b>${entry.usage}</b> 字符</span>` : ''}
+      ${entry.extra && entry.extra.durationMs ? `<span>时长：<b>${fmtDur(entry.extra.durationMs)}</b></span>` : ''}
+      ${entry.extra && entry.extra.size ? `<span>大小：<b>${fmtBytes(entry.extra.size)}</b></span>` : ''}
+      ${entry.extra && entry.extra.sampleRate ? `<span>采样率：<b>${entry.extra.sampleRate} Hz</b></span>` : ''}
       <span>耗时：<b>${elapsed}</b> 秒</span>
       ${entry.audioCached ? '<span>🎧 音频已缓存到本地</span>' : ''}
     </div>
@@ -1405,11 +1590,12 @@ function renderAsyncResult(entry){
     ${entry.downloadUrl ? `<div class="kv"><span>下载链接：<a href="${esc(entry.downloadUrl)}" target="_blank" rel="noopener" style="color:var(--accent2)">点击打开</a>（9 小时有效）</span></div>` : ''}
     <div class="acts">
       ${entry.taskId && (st === 'Processing' || st === '') ? `<button class="btn" data-act="query" data-id="${entry.id}">🔄 查询状态</button>` : ''}
-      ${st === 'Success' && !entry.downloadUrl && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 获取下载链接</button>` : ''}
+      ${st === 'Success' && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 ${entry.downloadUrl ? '重取下载链接' : '获取下载链接'}</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>` : ''}
       ${entry.subtitleFileId && !entry.subtitleUrl ? `<button class="btn" data-act="retrieveSub" data-id="${entry.id}">💬 获取字幕</button>` : ''}
       ${entry.subtitleUrl || entry.subtitleCached ? `<button class="btn" data-act="downloadSub" data-id="${entry.id}">💬 下载字幕</button>` : ''}
+      ${entry.raws ? `<button class="btn" data-act="raw" data-id="${entry.id}">🔍 原始响应</button>` : ''}
       ${entry.taskId ? `<button class="btn" data-act="copytask" data-id="${entry.id}">📋 复制 task_id</button>` : ''}
     </div>
     ${entry.subtitleUrl || entry.subtitleCached ? `
@@ -1417,10 +1603,15 @@ function renderAsyncResult(entry){
       <div class="st">💬 字幕文件（时间戳精确到句）${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''}</div>
       ${entry.subtitlePreview ? `<div class="subprev">${esc(entry.subtitlePreview)}</div>` : ''}
     </div>` : ''}
+    ${entry.tarEntries && entry.tarEntries.length ? `
+    <div class="sub-sec">
+      <div class="st">📦 归档内容（tar 已自动解包）</div>
+      ${entry.tarEntries.map(x => `<div class="exf-row"><span class="exf-name" title="${esc(x.name)}">${esc(baseName(x.name))}</span><span class="exf-size">${fmtBytes(x.size)}</span></div>`).join('')}
+    </div>` : ''}
     ${entry.extraFiles && entry.extraFiles.length ? `
     <div class="sub-sec">
       <div class="st">📎 附加文件 ×${entry.extraFiles.length}</div>
-      ${entry.extraFiles.map((x, i) => `<div class="exf-row"><span class="exf-name" title="${esc(x.fileId)}">${esc(x.filename || ('文件 ' + (i + 1)))}</span>${x.url ? `<button class="btn btn-sm" data-act="dlExtra" data-id="${entry.id}" data-idx="${i}">⬇ 下载</button>` : `<span class="exf-err">${esc(x.error || '获取失败')}</span>`}</div>`).join('')}
+      ${entry.extraFiles.map((x, i) => `<div class="exf-row"><span class="exf-name" title="${esc(x.fileId)}">${esc(x.filename || ('文件 ' + (i + 1)))}</span>${(x.url || x.cached) ? `<button class="btn btn-sm" data-act="dlExtra" data-id="${entry.id}" data-idx="${i}">⬇ 下载</button>` : `<span class="exf-err">${esc(x.error || '获取失败')}</span>`}</div>`).join('')}
     </div>` : ''}`;
   el.classList.add('show');
 }
@@ -1452,7 +1643,8 @@ function actsFor(e){
   const st = e.taskStatus;
   if (e.status === 'failed') a.push(`<button class="btn btn-sm" data-act="redo" data-id="${e.id}">↻ 重新合成</button>`);
   if (e.mode === 'async' && e.taskId && (st === 'Processing' || !st)) a.push(`<button class="btn btn-sm" data-act="query" data-id="${e.id}">🔄 查询</button>`);
-  if (st === 'Success' && !e.downloadUrl && e.fileId) a.push(`<button class="btn btn-sm" data-act="retrieve" data-id="${e.id}">🔗 获取链接</button>`);
+  if (e.mode === 'async' && e.raws) a.push(`<button class="btn btn-sm" data-act="raw" data-id="${e.id}">🔍 原始</button>`);
+  if (st === 'Success' && e.fileId) a.push(`<button class="btn btn-sm" data-act="retrieve" data-id="${e.id}">🔗 ${e.downloadUrl ? '重取' : '获取链接'}</button>`);
   if (e.subtitleFileId && !e.subtitleUrl) a.push(`<button class="btn btn-sm" data-act="retrieveSub" data-id="${e.id}">💬 取字幕</button>`);
   if (e.subtitleUrl || e.subtitleCached) a.push(`<button class="btn btn-sm" data-act="downloadSub" data-id="${e.id}">💬 字幕</button>`);
   if (e.audioCached || e.downloadUrl){
@@ -1460,6 +1652,7 @@ function actsFor(e){
     a.push(`<button class="btn btn-sm" data-act="download" data-id="${e.id}">⬇ 下载</button>`);
   }
   if (e.taskId) a.push(`<button class="btn btn-sm" data-act="copytask" data-id="${e.id}">📋 复制ID</button>`);
+  a.push(`<button class="btn btn-sm" data-act="view" data-id="${e.id}">📋 结果</button>`);
   a.push(`<button class="btn btn-sm btn-danger" data-act="del" data-id="${e.id}">🗑</button>`);
   return a.join('');
 }
@@ -1489,6 +1682,11 @@ function historyItemHtml(e){
     </div>
     <div class="h-text">${esc((e.text || '(无文本)').replace(/\s+/g, ' '))}</div>
     ${meta.length ? `<div class="h-meta">${meta.join('')}</div>` : ''}
+    ${e.subtitlePreview ? `
+    <details class="h-sub">
+      <summary>💬 字幕预览（时间轴）</summary>
+      <pre class="subprev" style="margin:6px 0 0">${esc(e.subtitlePreview)}</pre>
+    </details>` : ''}
     <div class="h-acts">${actsFor(e)}</div>
   </li>`;
 }
@@ -1510,6 +1708,25 @@ function renderHistory(){
   $('#historyList').innerHTML = list.length
     ? list.map(historyItemHtml).join('')
     : '<div class="empty"><span class="big">📭</span>暂无记录<br>完成一次合成后会自动保存到这里</div>';
+}
+
+/* ==================== 原始响应查看 ==================== */
+let currentRawEntryId = null;
+function showRaw(id){
+  const e = history.find(h => h.id === id);
+  if (!e || !e.raws || !Object.keys(e.raws).length) return toast('该任务没有保存原始响应（重新查询/检索后即可查看）', 'warn');
+  currentRawEntryId = id;
+  $('#rawContent').innerHTML = Object.entries(e.raws).map(([k, v]) => `
+    <div class="raw-sec">
+      <div class="rk">${esc(k)} · ${esc(timeStr(v.ts))}${v.truncated ? '（已截断）' : ''}</div>
+      <pre class="raw-pre">${esc(v.json)}</pre>
+    </div>`).join('');
+  $('#rawOverlay').classList.add('show');
+}
+function copyCurrentRaw(){
+  const e = history.find(h => h.id === currentRawEntryId);
+  if (!e || !e.raws) return;
+  copyText(Object.entries(e.raws).map(([k, v]) => '===== ' + k + ' =====\n' + v.json).join('\n\n'));
 }
 
 /* ==================== 表单联动 ==================== */
@@ -1725,6 +1942,14 @@ function bindEvents(){
     else if (act === 'retrieveSub') retrieveSubtitle(id);
     else if (act === 'downloadSub') downloadSubtitle(id);
     else if (act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
+    else if (act === 'raw') showRaw(id);
+    else if (act === 'view'){
+      const en = history.find(h => h.id === id);
+      if (!en) return;
+      if (en.mode === 'sync' && en.status !== 'success') return toast('该记录合成失败，无结果卡片', 'warn');
+      if (en.mode === 'async'){ renderAsyncResult(en); $('#asyncResult').scrollIntoView({ behavior:'smooth', block:'center' }); }
+      else { renderSyncResult(en); $('#syncResult').scrollIntoView({ behavior:'smooth', block:'center' }); }
+    }
     else if (act === 'copytask'){
       const en = history.find(h => h.id === id);
       if (en && en.taskId) copyText(en.taskId);
@@ -1748,6 +1973,7 @@ function bindEvents(){
       else if (btn.dataset.act === 'retrieveSub') retrieveSubtitle(id);
       else if (btn.dataset.act === 'downloadSub') downloadSubtitle(id);
       else if (btn.dataset.act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
+      else if (btn.dataset.act === 'raw') showRaw(id);
       else if (btn.dataset.act === 'copytask'){
         const en = history.find(h => h.id === id);
         if (en && en.taskId) copyText(en.taskId);
@@ -1779,6 +2005,11 @@ function bindEvents(){
   // 播放器
   $('#playerClose').addEventListener('click', closePlayer);
   $('#playerAudio').addEventListener('ended', closePlayer);
+
+  // 原始响应弹层
+  $('#btnRawClose').addEventListener('click', () => $('#rawOverlay').classList.remove('show'));
+  $('#btnCopyRaw').addEventListener('click', copyCurrentRaw);
+  $('#rawOverlay').addEventListener('click', e => { if (e.target === $('#rawOverlay')) $('#rawOverlay').classList.remove('show'); });
 }
 
 /* ==================== 初始化 ==================== */
