@@ -119,11 +119,6 @@ main{
 .exf-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .exf-err{color:var(--err);font-size:11.5px}
 .exf-size{font-size:11px;color:var(--text3);flex:none}
-.raw-acts{display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
-.raw-hint{font-size:11.5px;color:var(--text3);flex:1;min-width:150px}
-.raw-sec{margin-bottom:12px}
-.raw-sec .rk{font-size:12px;color:var(--accent2);margin-bottom:4px}
-.raw-pre{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--bg);border:1px solid var(--border);border-radius:9px;padding:10px;max-height:260px;overflow:auto;white-space:pre-wrap;word-break:break-all;color:var(--text2)}
 
 [data-only]{display:none}
 body[mode=async] [data-only=async]{display:block}
@@ -518,19 +513,6 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
   </div>
 </div>
 
-<!-- 原始响应弹层 -->
-<div class="overlay" id="rawOverlay">
-  <div class="modal" style="width:min(760px,100%)">
-    <h3>🔍 原始响应</h3>
-    <div class="raw-acts">
-      <button class="btn btn-sm" id="btnCopyRaw">📋 复制全部</button>
-      <span class="raw-hint">若字幕未出现，复制「查询状态」的 JSON 即可定位字幕字段名</span>
-    </div>
-    <div id="rawContent"></div>
-    <div class="m-acts"><button class="btn" id="btnRawClose">关闭</button></div>
-  </div>
-</div>
-
 <div id="toast"></div>
 
 <script>
@@ -565,15 +547,6 @@ async function copyText(t){
     document.execCommand('copy'); ta.remove();
   }
   toast('已复制到剪贴板');
-}
-
-function storeRaw(entry, kind, res){
-  try {
-    const s = JSON.stringify(res);
-    const cap = 8000;
-    if (!entry.raws) entry.raws = {};
-    entry.raws[kind] = { json: s.length > cap ? s.slice(0, cap) : s, truncated: s.length > cap, ts: Date.now() };
-  } catch(e){}
 }
 
 /* ---- tar 归档解析（ustar 格式，用于解包音频+字幕打包结果） ---- */
@@ -1053,7 +1026,6 @@ async function runAsyncCreate(){
       fileId: res.file_id != null ? String(res.file_id) : '',
       usage: res.usage_characters || 0
     };
-    storeRaw(entry, '创建任务', res);
     upsertHistory(entry);
     renderHistory();
     renderAsyncResult(entry);
@@ -1072,7 +1044,6 @@ async function queryTaskById(id, { silent=false } = {}){
   querying.add(id);
   try {
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(entry.taskId));
-    storeRaw(entry, '查询状态', res);
     entry.taskStatus = String(res.status || entry.taskStatus || 'Processing');
     if (Array.isArray(res.file_id)){ // zip 多章节可能一次返回多个文件 ID
       const ids = res.file_id.map(String);
@@ -1106,7 +1077,6 @@ async function retrieveById(id, { silent=false } = {}){
   if (!entry || !entry.fileId) return;
   try {
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.fileId));
-    storeRaw(entry, '检索文件', res);
     const files = Array.isArray(res.file) ? res.file : [res.file].filter(Boolean);
     const f = files.find(x => !/subtitle/i.test(String(x.filename || '')) && !/\.json$/i.test(String(x.filename || ''))) || files[0];
     if (!f || !f.download_url) throw new Error('未获取到下载链接');
@@ -1222,7 +1192,6 @@ async function retrieveSubtitle(id, { silent=false } = {}){
   if (!entry || !entry.subtitleFileId) return;
   try {
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.subtitleFileId));
-    storeRaw(entry, '检索字幕', res);
     const f = Array.isArray(res.file) ? res.file[0] : res.file;
     if (!f || !f.download_url) throw new Error('未获取到字幕下载链接');
     entry.subtitleUrl = f.download_url;
@@ -1240,7 +1209,7 @@ async function retrieveSubtitle(id, { silent=false } = {}){
   } catch(err){ if (!silent) toast(err.message, 'error'); }
 }
 
-async function downloadSubtitle(id){
+async function downloadSubtitle(id, silent){
   const e = history.find(h => h.id === id);
   if (!e) return;
   let blob = null;
@@ -1257,15 +1226,15 @@ async function downloadSubtitle(id){
     const srt = titlesToSrt(await blob.text().catch(() => ''));
     if (srt){
       downloadBlob(new Blob(['﻿' + srt], { type:'text/plain;charset=utf-8' }), entryAudioBase(e) + '.srt');
-      toast('✅ 已下载标准 SRT 字幕');
+      if (!silent) toast('✅ 已下载标准 SRT 字幕');
     } else {
       const ext = ((e.subtitleFileName || '').match(/\.([a-z0-9]+)$/i) || [,'json'])[1].toLowerCase();
-      downloadBlob(blob, 'minimax_subtitle_' + fileTs(e.ts) + '.' + ext);
-      toast('⚠️ 内容不是 .titles JSON，已按原格式下载');
+      downloadBlob(blob, entryAudioBase(e) + '.' + ext);
+      if (!silent) toast('⚠️ 内容不是 .titles JSON，已按原格式下载');
     }
   }
   else if (e.subtitleUrl) window.open(e.subtitleUrl, '_blank');
-  else toast('没有可下载的字幕', 'error');
+  else if (!silent) toast('没有可下载的字幕', 'error');
 }
 
 async function downloadSubtitleRaw(id){
@@ -1630,7 +1599,12 @@ async function downloadEntry(id){
   if (blob){
     const ext = ((e.fileName || '').match(/\.([a-z0-9]+)$/i) || [, e.format || 'mp3'])[1].toLowerCase();
     downloadBlob(blob, entryAudioBase(e) + '.' + ext);
-    toast('已开始下载');
+    if (e.subtitleCached || e.subtitleUrl){
+      setTimeout(() => downloadSubtitle(id, true), 500); // 音频 + 同名 SRT 一起下载
+      toast('已开始下载音频，同名 SRT 字幕将随后下载');
+    } else {
+      toast('已开始下载');
+    }
   } else if (e.downloadUrl){
     window.open(e.downloadUrl, '_blank');
     toast('已在新标签页打开下载链接', 'warn');
@@ -1688,16 +1662,11 @@ function renderAsyncResult(entry){
       ${st === 'Success' && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 ${entry.downloadUrl ? '重取下载链接' : '获取下载链接'}</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>` : ''}
-      ${entry.subtitleFileId && !entry.subtitleUrl ? `<button class="btn" data-act="retrieveSub" data-id="${entry.id}">💬 获取字幕</button>` : ''}
-      ${entry.subtitleUrl || entry.subtitleCached ? `<button class="btn" data-act="downloadSub" data-id="${entry.id}">💬 下载 SRT 字幕</button>` : ''}
-      ${entry.raws ? `<button class="btn" data-act="raw" data-id="${entry.id}">🔍 原始响应</button>` : ''}
-      ${entry.taskId ? `<button class="btn" data-act="copytask" data-id="${entry.id}">📋 复制 task_id</button>` : ''}
     </div>
     ${entry.subtitleUrl || entry.subtitleCached ? `
     <div class="sub-sec">
-      <div class="st">💬 字幕文件${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''} · 播放音频时在下方播放器同步显示</div>
+      <div class="st">💬 字幕文件${entry.subtitleFileName ? ' · ' + esc(entry.subtitleFileName) : ''} · 播放时同步显示，点「⬇ 下载」随音频一并下载同名 SRT</div>
       <div class="acts">
-        <button class="btn btn-sm" data-act="downloadSub" data-id="${entry.id}">⬇ 下载 SRT 字幕</button>
         <button class="btn btn-sm" data-act="downloadSubRaw" data-id="${entry.id}">原文件（${esc(((entry.subtitleFileName || 'titles').match(/\.([a-z0-9]+)$/i) || [,'titles'])[1])}）</button>
       </div>
     </div>` : ''}
@@ -1741,15 +1710,11 @@ function actsFor(e){
   const st = e.taskStatus;
   if (e.status === 'failed') a.push(`<button class="btn btn-sm" data-act="redo" data-id="${e.id}">↻ 重新合成</button>`);
   if (e.mode === 'async' && e.taskId && (st === 'Processing' || !st)) a.push(`<button class="btn btn-sm" data-act="query" data-id="${e.id}">🔄 查询</button>`);
-  if (e.mode === 'async' && e.raws) a.push(`<button class="btn btn-sm" data-act="raw" data-id="${e.id}">🔍 原始</button>`);
   if (st === 'Success' && e.fileId) a.push(`<button class="btn btn-sm" data-act="retrieve" data-id="${e.id}">🔗 ${e.downloadUrl ? '重取' : '获取链接'}</button>`);
-  if (e.subtitleFileId && !e.subtitleUrl) a.push(`<button class="btn btn-sm" data-act="retrieveSub" data-id="${e.id}">💬 取字幕</button>`);
-  if (e.subtitleUrl || e.subtitleCached) a.push(`<button class="btn btn-sm" data-act="downloadSub" data-id="${e.id}">💬 SRT</button>`);
   if (e.audioCached || e.downloadUrl){
     a.push(`<button class="btn btn-sm" data-act="play" data-id="${e.id}">▶ 播放</button>`);
     a.push(`<button class="btn btn-sm" data-act="download" data-id="${e.id}">⬇ 下载</button>`);
   }
-  if (e.taskId) a.push(`<button class="btn btn-sm" data-act="copytask" data-id="${e.id}">📋 复制ID</button>`);
   a.push(`<button class="btn btn-sm" data-act="view" data-id="${e.id}">📋 结果</button>`);
   a.push(`<button class="btn btn-sm btn-danger" data-act="del" data-id="${e.id}">🗑</button>`);
   return a.join('');
@@ -1801,25 +1766,6 @@ function renderHistory(){
   $('#historyList').innerHTML = list.length
     ? list.map(historyItemHtml).join('')
     : '<div class="empty"><span class="big">📭</span>暂无记录<br>完成一次合成后会自动保存到这里</div>';
-}
-
-/* ==================== 原始响应查看 ==================== */
-let currentRawEntryId = null;
-function showRaw(id){
-  const e = history.find(h => h.id === id);
-  if (!e || !e.raws || !Object.keys(e.raws).length) return toast('该任务没有保存原始响应（重新查询/检索后即可查看）', 'warn');
-  currentRawEntryId = id;
-  $('#rawContent').innerHTML = Object.entries(e.raws).map(([k, v]) => `
-    <div class="raw-sec">
-      <div class="rk">${esc(k)} · ${esc(timeStr(v.ts))}${v.truncated ? '（已截断）' : ''}</div>
-      <pre class="raw-pre">${esc(v.json)}</pre>
-    </div>`).join('');
-  $('#rawOverlay').classList.add('show');
-}
-function copyCurrentRaw(){
-  const e = history.find(h => h.id === currentRawEntryId);
-  if (!e || !e.raws) return;
-  copyText(Object.entries(e.raws).map(([k, v]) => '===== ' + k + ' =====\n' + v.json).join('\n\n'));
 }
 
 /* ==================== 表单联动 ==================== */
@@ -2035,17 +1981,12 @@ function bindEvents(){
     else if (act === 'retrieveSub') retrieveSubtitle(id);
     else if (act === 'downloadSub') downloadSubtitle(id);
     else if (act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
-    else if (act === 'raw') showRaw(id);
     else if (act === 'view'){
       const en = history.find(h => h.id === id);
       if (!en) return;
       if (en.mode === 'sync' && en.status !== 'success') return toast('该记录合成失败，无结果卡片', 'warn');
       if (en.mode === 'async'){ renderAsyncResult(en); $('#asyncResult').scrollIntoView({ behavior:'smooth', block:'center' }); }
       else { renderSyncResult(en); $('#syncResult').scrollIntoView({ behavior:'smooth', block:'center' }); }
-    }
-    else if (act === 'copytask'){
-      const en = history.find(h => h.id === id);
-      if (en && en.taskId) copyText(en.taskId);
     }
     else if (act === 'redo') redoEntry(id);
     else if (act === 'del'){
@@ -2067,11 +2008,6 @@ function bindEvents(){
       else if (btn.dataset.act === 'downloadSub') downloadSubtitle(id);
       else if (btn.dataset.act === 'downloadSubRaw') downloadSubtitleRaw(id);
       else if (btn.dataset.act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
-      else if (btn.dataset.act === 'raw') showRaw(id);
-      else if (btn.dataset.act === 'copytask'){
-        const en = history.find(h => h.id === id);
-        if (en && en.taskId) copyText(en.taskId);
-      }
     });
   });
 
@@ -2100,11 +2036,6 @@ function bindEvents(){
   $('#playerClose').addEventListener('click', closePlayer);
   $('#playerAudio').addEventListener('ended', closePlayer);
   $('#playerAudio').addEventListener('timeupdate', () => { if (player.subs) showCurrentSub(); });
-
-  // 原始响应弹层
-  $('#btnRawClose').addEventListener('click', () => $('#rawOverlay').classList.remove('show'));
-  $('#btnCopyRaw').addEventListener('click', copyCurrentRaw);
-  $('#rawOverlay').addEventListener('click', e => { if (e.target === $('#rawOverlay')) $('#rawOverlay').classList.remove('show'); });
 }
 
 /* ==================== 初始化 ==================== */
