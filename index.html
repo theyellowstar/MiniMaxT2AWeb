@@ -855,6 +855,7 @@ async function fetchVoices(silent){
   const old = btn.textContent;
   btn.textContent = '拉取中…';
   try {
+    // 查询可用音色 → {system_voice, voice_cloning, voice_generation}；复刻/文生音色需合成成功过一次才出现
     const res = await apiCall('/v1/get_voice', { method:'POST', body:{ voice_type:'all' } });
     const groups = {};
     let total = 0;
@@ -974,6 +975,7 @@ async function runSync(){
   try {
     const body = buildCommonBody(text, false);
     body.output_format = settings.outputFormat;
+    // 同步合成：响应 data.audio（hex/url）+ data.subtitle_file（subtitle_enable=true 时）+ extra_info
     const res = await apiCall('/v1/t2a_v2', { method:'POST', body });
 
     const d = res.data || {};
@@ -1049,6 +1051,7 @@ async function runAsyncCreate(){
   if (!useFile && text.length > 50000 && !confirm('异步接口直传文本上限约 5 万字符，建议使用文件上传；仍要直传提交吗？')) return;
   setBusy(true);
   try {
+    // 创建异步任务 → {task_id, file_id, usage_characters}（该版本始终产出 with_meta.tar）
     const res = await apiCall('/v1/t2a_async_v2', { method:'POST', body: buildCommonBody(text, true) });
     if (res.task_id == null) throw new Error('未返回 task_id，响应：' + JSON.stringify(res).slice(0, 300));
 
@@ -1085,6 +1088,7 @@ async function queryTaskById(id, { silent=false } = {}){
   if (querying.has(id)) return;
   querying.add(id);
   try {
+    // 查询状态 → {status: Processing|Success|Failed|Expired, file_id}；限 10 次/秒，勿短于 3 秒轮询
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(entry.taskId));
     entry.taskStatus = String(res.status || entry.taskStatus || 'Processing');
     if (res.file_id != null) entry.fileId = String(res.file_id);
@@ -1110,6 +1114,7 @@ async function retrieveById(id, { silent=false } = {}){
   const entry = history.find(h => h.id === id);
   if (!entry || !entry.fileId) return;
   try {
+    // 检索文件 → file.download_url 指向 with_meta.tar（音频+字幕打包），9 小时有效；bytes 恒为 0
     const res = await apiCall('/v1/files/retrieve?file_id=' + encodeURIComponent(entry.fileId));
     const files = Array.isArray(res.file) ? res.file : [res.file].filter(Boolean);
     const f = files.find(x => !/subtitle/i.test(String(x.filename || '')) && !/\.json$/i.test(String(x.filename || ''))) || files[0];
@@ -1245,7 +1250,7 @@ function setupTicker(){
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
   const iv = +settings.pollInterval || 0;
   if (iv <= 0) return; // 不轮询：仅手动查询
-  tickTimer = setInterval(tick, Math.max(3000, iv));
+  tickTimer = setInterval(tick, Math.max(3000, iv)); // 下限 3 秒（接口限 10 次/秒）
 }
 async function tick(){
   if (ticking) return;
@@ -1367,9 +1372,10 @@ async function uploadTextFile(){
         toast('已拆分为 ' + chapters.length + ' 个章节，开始上传 zip');
       }
     }
-    if (f.size > 5 * 1024 * 1024 && !confirm('文件较大（' + fmtBytes(f.size) + '），仍要上传吗？')) return;
+    if (f.size > 5 * 1024 * 1024 && !confirm('文件较大（' + fmtBytes(f.size) + '），仍要上传吗？')) return; // 5MB 仅提示，不做硬拦截
     const fd = new FormData();
     fd.append('file', f);
+    // 文本文件上传 → {file_id}；purpose 固定 t2a_async_input
     fd.append('purpose', 't2a_async_input');
     const res = await apiCall('/v1/files/upload', { method:'POST', formData: fd });
     const fid = res.file_id ?? (res.file && res.file.file_id);
