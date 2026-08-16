@@ -644,6 +644,7 @@ async function saveBlob(blob, filename){
 const LS_SETTINGS = 'mm_tts_settings_v1';
 const LS_HISTORY  = 'mm_tts_history_v1';
 const LS_VOICES   = 'mm_tts_voices_v1';
+const LS_RECENT   = 'mm_tts_voice_recent_v1';
 const DB_NAME = 'mm_tts_db', DB_STORE = 'audio';
 const MAX_HISTORY = 200;
 
@@ -819,6 +820,7 @@ async function previewVoice(voiceId, btnEl){
       idbPut(cacheKey, blob); // 本地缓存：同一音色+模型再次试听直接秒开，不重复计费
     }
     playBlobInPlayer(blob, '试听：' + voiceId);
+    recordVoiceUse(voiceId, voiceNameOf(voiceId));
   } catch(err){ toast('试听失败：' + err.message, 'error'); }
   finally {
     previewBusy.delete(voiceId);
@@ -829,8 +831,25 @@ async function previewVoice(voiceId, btnEl){
 /* ==================== 音色拉取（官方 get_voice 接口） ==================== */
 const VOICE_GROUP_NAMES = { system_voice:'系统音色', voice_cloning:'复刻音色', voice_generation:'文生音色' };
 let voiceBank = loadJSON(LS_VOICES, { ts:0, groups:{ system_voice:[], voice_cloning:[], voice_generation:[] } });
+let recentVoices = loadJSON(LS_RECENT, []);
 
-async function fetchVoices(){
+function voiceNameOf(id){
+  for (const arr of Object.values(voiceBank.groups))
+    for (const v of arr) if (v.id === id) return v.name;
+  return id;
+}
+
+// 记录使用过的音色（最近使用列表，去重、最新在前，最多 10 个）
+function recordVoiceUse(voiceId, name){
+  if (!voiceId) return;
+  recentVoices = recentVoices.filter(v => v.id !== voiceId);
+  recentVoices.unshift({ id: voiceId, name: name || voiceId, ts: Date.now() });
+  if (recentVoices.length > 10) recentVoices.length = 10;
+  try { localStorage.setItem(LS_RECENT, JSON.stringify(recentVoices)); } catch(e){}
+  renderVoiceBank();
+}
+
+async function fetchVoices(silent){
   const btn = $('#btnFetchVoices');
   btn.disabled = true;
   const old = btn.textContent;
@@ -848,21 +867,28 @@ async function fetchVoices(){
     voiceBank = { ts:Date.now(), groups };
     try { localStorage.setItem(LS_VOICES, JSON.stringify(voiceBank)); } catch(e){}
     renderVoiceBank(true);
-    toast('✅ 拉取到 ' + total + ' 个音色，已更新列表');
-  } catch(err){ toast(err.message, 'error'); }
+    if (!silent) toast('✅ 拉取到 ' + total + ' 个音色，已更新列表');
+  } catch(err){ if (!silent) toast(err.message, 'error'); }
   finally { btn.disabled = false; btn.textContent = old; }
 }
 
 function renderVoiceBank(open){
-  const total = Object.values(voiceBank.groups).reduce((s, a) => s + a.length, 0);
+  const fetchedTotal = Object.values(voiceBank.groups).reduce((s, a) => s + a.length, 0);
+  const total = fetchedTotal + recentVoices.length;
   const bank = $('#voiceBank');
   if (!total){ bank.style.display = 'none'; return; }
   if (open){ bank.style.display = ''; $('#btnVoiceBankToggle').textContent = '收起'; $('#voiceBankGroups').style.display = ''; }
   $('#voiceBankTime').textContent = voiceBank.ts ? '更新于 ' + timeStr(voiceBank.ts) : '';
 
-  // 更新 datalist（以官方返回为准，替换内置预设）
+  // 更新 datalist（最近使用 + 官方音色）
   const dl = $('#voiceList');
   dl.innerHTML = '';
+  for (const v of recentVoices){
+    const o = document.createElement('option');
+    o.value = v.id;
+    o.label = '最近使用｜' + v.name;
+    dl.appendChild(o);
+  }
   for (const [key, arr] of Object.entries(voiceBank.groups))
     for (const v of arr){
       const o = document.createElement('option');
@@ -871,21 +897,21 @@ function renderVoiceBank(open){
       dl.appendChild(o);
     }
 
-  // 渲染分组 chip
+  // 分组 chips：最近使用 → 系统/复刻/文生
   const f = $('#voiceBankFilter').value.trim().toLowerCase();
   const box = $('#voiceBankGroups');
   box.innerHTML = '';
   let shown = 0;
-  for (const [key, arr] of Object.entries(voiceBank.groups)){
-    const list = arr.filter(v => !f || v.name.toLowerCase().includes(f) || v.id.toLowerCase().includes(f));
-    if (!list.length) continue;
-    shown += list.length;
+  const addGroup = (title, list) => {
+    const filtered = list.filter(v => !f || String(v.name).toLowerCase().includes(f) || String(v.id).toLowerCase().includes(f));
+    if (!filtered.length) return;
+    shown += filtered.length;
     const sec = document.createElement('div');
     sec.className = 'vb-group';
-    sec.innerHTML = `<div class="vb-gname">${VOICE_GROUP_NAMES[key]} <span class="vb-n">${list.length}</span></div>`;
+    sec.innerHTML = `<div class="vb-gname">${title} <span class="vb-n">${filtered.length}</span></div>`;
     const chips = document.createElement('div');
     chips.className = 'vb-chips';
-    for (const v of list){
+    for (const v of filtered){
       const c = document.createElement('span');
       c.className = 'vchip' + (v.id === $('#voiceId').value ? ' on' : '');
       c.innerHTML = `<span class="vc-name" title="${esc(v.id)}">${esc(v.name)}</span><button class="vc-play" title="试听此音色">▶</button>`;
@@ -904,7 +930,9 @@ function renderVoiceBank(open){
     }
     sec.appendChild(chips);
     box.appendChild(sec);
-  }
+  };
+  addGroup('🕘 最近使用', recentVoices);
+  for (const [key, arr] of Object.entries(voiceBank.groups)) addGroup(VOICE_GROUP_NAMES[key], arr);
   if (!shown) box.innerHTML = '<div class="vb-empty">没有匹配的音色</div>';
 }
 
@@ -990,6 +1018,7 @@ async function runSync(){
       }
     }
     await idbPut(entry.id, blob);
+    recordVoiceUse(settings.voiceId, voiceNameOf(settings.voiceId));
     upsertHistory(entry);
     renderHistory();
     renderSyncResult(entry);
@@ -1034,6 +1063,7 @@ async function runAsyncCreate(){
       fileId: res.file_id != null ? String(res.file_id) : '',
       usage: res.usage_characters || 0
     };
+    recordVoiceUse(settings.voiceId, voiceNameOf(settings.voiceId));
     upsertHistory(entry);
     renderHistory();
     renderAsyncResult(entry);
@@ -1794,6 +1824,7 @@ function openSettings(){
   $('#setOverlay').classList.add('show');
 }
 function applySettingsModal(){
+  const oldKey = settings.apiKey;
   settings.apiKey = $('#setApiKey').value.trim();
   const base = $('#setBase').value;
   settings.customBase = $('#setCustomBase').value.trim();
@@ -1804,6 +1835,8 @@ function applySettingsModal(){
   saveSettings();
   toast('✅ 设置已保存');
   $('#setOverlay').classList.remove('show');
+  // 首次填写或更换 API Key 后，自动拉取音色列表
+  if (settings.apiKey && settings.apiKey !== oldKey) fetchVoices();
 }
 
 /* ==================== 导出 / 导入 ==================== */
@@ -1984,6 +2017,10 @@ renderHistory();
 setupTicker(); // 页面刷新后自动续查「处理中」的异步任务
 bindEvents();
 updateCount();
+// 已配置 API Key 时自动拉取音色：无缓存或缓存超过 7 天（静默失败，可手动点按钮重试）
+if (settings.apiKey && (!voiceBank.ts || Date.now() - voiceBank.ts > 7 * 24 * 3600 * 1000)){
+  fetchVoices(true);
+}
 </script>
 </body>
 </html>
