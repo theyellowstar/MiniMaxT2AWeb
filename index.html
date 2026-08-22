@@ -593,12 +593,14 @@ function fmtSrtTs(ms){
   const h = Math.floor(ms / 3600000), m = Math.floor(ms % 3600000 / 60000), s = Math.floor(ms % 60000 / 1000), mm = ms % 1000;
   return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') + ',' + String(mm).padStart(3, '0');
 }
-function titlesToSrt(text){
-  const subs = parseSubtitle(text);
-  if (!subs.length) return '';
+function subsToSrt(subs){
   return subs.map((s, i) =>
     (i + 1) + '\n' + fmtSrtTs(s.begin) + ' --> ' + fmtSrtTs(s.end) + '\n' + s.text + '\n'
   ).join('\n');
+}
+function titlesToSrt(text){
+  const subs = parseSubtitle(text);
+  return subs.length ? subsToSrt(subs) : '';
 }
 
 function hexToBytes(hex){
@@ -1244,6 +1246,102 @@ async function downloadExtra(id, idx){
   if (method === 'picker') toast('✅ 已保存（无网络标记）');
 }
 
+/* ---- 多章节合并：字节拼 mp3 + 时间轴偏移拼 SRT ---- */
+function chapterNo(name){ // content-…_<fid>_<N>.mp3/.titles/.extra → N
+  const m = String(name || '').match(/_(\d+)\.(mp3|wav|flac|aac|pcm|ogg|titles|extra)$/i);
+  return m ? +m[1] : null;
+}
+// 去掉 mp3 首部 ID3v2 / 尾部 ID3v1 标签，得到纯净 MPEG 帧流（多段拼接时才不会夹带标签）
+function stripMp3Tags(u8){
+  if (u8.length >= 10 && u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33){ // "ID3"
+    const size = ((u8[6] & 0x7f) << 21) | ((u8[7] & 0x7f) << 14) | ((u8[8] & 0x7f) << 7) | (u8[9] & 0x7f);
+    u8 = u8.subarray(Math.min(u8.length, 10 + size));
+  }
+  if (u8.length >= 128 && u8[u8.length - 128] === 0x54 && u8[u8.length - 127] === 0x41 && u8[u8.length - 126] === 0x47){ // "TAG"
+    u8 = u8.subarray(0, u8.length - 128);
+  }
+  return u8;
+}
+// 汇总该条目所有已缓存文件（主音频 + 主字幕 + tar 内附件），标注类型与读取器
+function entryFiles(e){
+  const files = [];
+  if (e.fileName) files.push({ name:e.fileName, kind:'audio', get:() => idbGet(e.id) });
+  if (e.subtitleFileName) files.push({ name:e.subtitleFileName, kind:'subtitle', get:() => idbGet('sub:' + e.id) });
+  (e.extraFiles || []).forEach((x, i) => {
+    const name = x.filename || '';
+    const kind = /\.(mp3|wav|flac|aac|pcm|ogg)$/i.test(name) ? 'audio' : /\.extra$/i.test(name) ? 'extra' : isSubtitleName(name) ? 'subtitle' : 'other';
+    if (kind === 'other') return;
+    files.push({ name, kind, get:() => idbGet('exf:' + e.id + ':' + (x.idx != null ? x.idx : i)) });
+  });
+  return files;
+}
+function isMergeable(e){
+  if (!e.audioCached) return false; // 合并需要各段音频已缓存齐全
+  return entryFiles(e).filter(f => f.kind === 'audio').length >= 2;
+}
+// 按章节号分组并解析 blobs / .extra 时长；返回按章节号升序的 [{n, audio, subtitle, durationMs}]
+async function collectChapters(e){
+  const byN = new Map();
+  for (const f of entryFiles(e)){
+    const n = chapterNo(f.name);
+    if (n == null) continue;
+    if (!byN.has(n)) byN.set(n, { n });
+    byN.get(n)[f.kind] = f;
+  }
+  const chapters = [...byN.values()].sort((a, b) => a.n - b.n);
+  for (const ch of chapters){
+    ch.audio = ch.audio ? await ch.audio.get().catch(() => null) : null;
+    ch.subtitle = ch.subtitle ? await ch.subtitle.get().catch(() => null) : null;
+    ch.durationMs = 0;
+    if (ch.extra){
+      const exb = await ch.extra.get().catch(() => null);
+      if (exb){ try { ch.durationMs = JSON.parse(await exb.text()).audio_length || 0; } catch(_){} }
+    }
+  }
+  // 无 .extra 时长时，用该章字幕最大 end 兜底
+  for (const ch of chapters){
+    if (!ch.durationMs && ch.subtitle){
+      const subs = parseSubtitle(await ch.subtitle.text());
+      ch.durationMs = subs.reduce((mx, s) => Math.max(mx, s.end), 0);
+    }
+  }
+  return chapters;
+}
+async function mergeChapters(id){
+  const e = history.find(h => h.id === id);
+  if (!e) return;
+  const chapters = await collectChapters(e);
+  if (chapters.length < 2) return toast('该任务只有单个音频片段，无需合并', 'warn');
+  if (chapters.some(c => !c.audio)) return toast('部分音频片段未缓存，无法合并（可先点「获取下载链接」重新解包）', 'error');
+  setBusy(true);
+  try {
+    const parts = [], allSubs = [];
+    let offset = 0;
+    for (const ch of chapters){
+      parts.push(stripMp3Tags(new Uint8Array(await ch.audio.arrayBuffer())));
+      if (ch.subtitle){
+        const subs = parseSubtitle(await ch.subtitle.text());
+        for (const s of subs) allSubs.push({ text: s.text, begin: s.begin + offset, end: s.end + offset });
+      }
+      offset += ch.durationMs || 0;
+    }
+    const ext = ((e.fileName || '').match(/\.([a-z0-9]+)$/i) || [, e.format || 'mp3'])[1].toLowerCase();
+    const blob = new Blob(parts, { type: MIME[ext] || 'audio/mpeg' });
+    const base = entryAudioBase(e) + '_merged';
+    const m = await saveBlob(blob, base + '.' + ext);
+    if (m === 'cancelled') return;
+    if (allSubs.length){
+      const srt = subsToSrt(allSubs);
+      setTimeout(() => { saveBlob(new Blob(['﻿' + srt], { type:'text/plain;charset=utf-8' }), base + '.srt'); }, 400);
+      toast(m === 'picker' ? '✅ 合并音频已保存（无网络标记），即将弹出合并字幕保存框' : '已开始下载合并音频，合并 SRT 将随后下载');
+    } else {
+      toast(m === 'picker' ? '✅ 合并音频已保存（无网络标记）' : '已开始下载合并音频');
+    }
+  } catch(err){
+    toast('合并失败：' + err.message, 'error');
+  } finally { setBusy(false); }
+}
+
 /* ---- 轮询 ---- */
 let tickTimer = null, ticking = false;
 function setupTicker(){
@@ -1661,6 +1759,7 @@ function renderAsyncResult(entry){
       ${st === 'Success' && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 ${entry.downloadUrl ? '重取下载链接' : '获取下载链接'}</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>` : ''}
+      ${isMergeable(entry) ? `<button class="btn" data-act="merge" data-id="${entry.id}">🧩 合并下载</button>` : ''}
     </div>
     ${entry.subtitleUrl || entry.subtitleCached ? `
     <div class="sub-sec">
@@ -1714,6 +1813,7 @@ function actsFor(e){
     a.push(`<button class="btn btn-sm" data-act="play" data-id="${e.id}">▶ 播放</button>`);
     a.push(`<button class="btn btn-sm" data-act="download" data-id="${e.id}">⬇ 下载</button>`);
   }
+  if (isMergeable(e)) a.push(`<button class="btn btn-sm" data-act="merge" data-id="${e.id}">🧩 合并</button>`);
   a.push(`<button class="btn btn-sm" data-act="view" data-id="${e.id}">📋 结果</button>`);
   a.push(`<button class="btn btn-sm btn-danger" data-act="del" data-id="${e.id}">🗑</button>`);
   return a.join('');
@@ -1973,6 +2073,7 @@ function bindEvents(){
     const act = btn.dataset.act;
     if (act === 'play') playEntry(id);
     else if (act === 'download') downloadEntry(id);
+    else if (act === 'merge') mergeChapters(id);
     else if (act === 'query') queryTaskById(id);
     else if (act === 'retrieve') retrieveById(id);
     else if (act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
@@ -1997,6 +2098,7 @@ function bindEvents(){
       const id = btn.dataset.id;
       if (btn.dataset.act === 'play') playEntry(id);
       else if (btn.dataset.act === 'download') downloadEntry(id);
+      else if (btn.dataset.act === 'merge') mergeChapters(id);
       else if (btn.dataset.act === 'query') queryTaskById(id);
       else if (btn.dataset.act === 'retrieve') retrieveById(id);
       else if (btn.dataset.act === 'downloadSubRaw') downloadSubtitleRaw(id);

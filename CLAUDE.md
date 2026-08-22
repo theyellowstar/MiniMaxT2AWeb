@@ -80,6 +80,7 @@
 - **textarea 的 placeholder 被 `updateFileModeUI` 动态改写**，改原文提示时记得同步那里
 - **zip 拆分上传**：`buildZip` 用原生 `CompressionStream('deflate-raw')` 做 DEFLATE（不可用回退 STORE）并写入有效 DOS 时间戳；章节写成 JSON `{content:文本}`，**文件名必须是 `1.json`/`2.json`…（纯数字）**——`chapter_001.json` 会报 `check file in zip error`
 - 头部/手动操作区（task_id 查询、file_id 下载）在异步模式显示
+- **多章节合并下载**：zip 章节任务解包后，各段音频/字幕散落在 `<id>`（首段 mp3）、`sub:<id>`（首段 .titles）、`exf:<id>:<i>`（其余全部文件，含各章 mp3/.titles/.extra）。`mergeChapters` 按文件名 `_<N>.<ext>` 提取章节号分组，字节拼 mp3（`stripMp3Tags` 去每段 ID3v2/ID3v1），并用各章 `.extra` 的 `audio_length` 累计偏移拼 SRT；一键保存 `<base>_merged.mp3` + `<base>_merged.srt`。按钮只在音频段 ≥2 时显示（`isMergeable`）
 
 ## 死代码黑名单（验证过的错误假设，勿恢复）
 
