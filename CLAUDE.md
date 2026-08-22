@@ -48,7 +48,7 @@
 
 ### 文件上传与限制
 - `POST /v1/files/upload`（multipart：`file` + `purpose=t2a_async_input`）→ `file_id`
-- **单 txt < 10 万字符，超限报 2013**；zip 合计 ≤100 万字符，包内须同格式 txt/json。工具已做：≥10 万字符自动拆分章节（每章 <9 万）打包 zip 上传
+- **`text_file_id` 必须是整数（int64）**：以字符串发送会报 2013 `invalid params`（本会话曾因此误判为「超限」「zip 不支持」；修复：`buildCommonBody` 用 `+settings.textFileId`）。官方单 txt 文件上限 <100 万字符（不是 10 万）。zip 章节包内须同一格式 txt/json（json 字段 `title/content/extra`，可只给 `content`）；文件名必须 `1.json`/`2.json`…（纯数字，无前缀/补零）——`chapter_001.json` 会报 `check file in zip error`。拆分阈值 `SPLIT_CHARS=20000`：超过 2 万字符自动拆 zip（每章 ≤2 万），这是用户明确偏好，勿改回「单文件优先」。
 - `GET/POST /v1/get_voice`，body `{voice_type:"all"}` → `system_voice`/`voice_cloning`/`voice_generation` 数组（复刻/文生音色需成功合成过一次才出现）
 
 ### 错误码（CODE_MSG）
@@ -78,6 +78,7 @@
 - **fetchVoices 自动化**：页面加载时（有 Key 且无缓存/超 7 天）静默拉取；设置保存时 Key 变化自动拉取。`silent` 参数控制错误提示
 - **轮询**：`pollInterval=0` 表示不轮询（含创建后立即查一次也跳过）；`setupTicker` 在设置变更时重建
 - **textarea 的 placeholder 被 `updateFileModeUI` 动态改写**，改原文提示时记得同步那里
+- **zip 拆分上传**：`buildZip` 用原生 `CompressionStream('deflate-raw')` 做 DEFLATE（不可用回退 STORE）并写入有效 DOS 时间戳；章节写成 JSON `{content:文本}`，**文件名必须是 `1.json`/`2.json`…（纯数字）**——`chapter_001.json` 会报 `check file in zip error`
 - 头部/手动操作区（task_id 查询、file_id 下载）在异步模式显示
 
 ## 死代码黑名单（验证过的错误假设，勿恢复）
@@ -85,6 +86,7 @@
 - ❌ 查询响应会返回 `subtitle_file_id` 等字幕字段 → 实际没有，字幕在 tar 里
 - ❌ `files/retrieve` 会返回多文件数组 / 字幕对象 → 实际单文件（tar）
 - ❌ 查询会返回 file_id 数组（zip 多章节）→ 实际单 file_id
+- ❌ `text_file_id` 传字符串也能被接受 → 实际必须整数(int64)，字符串报 2013 `invalid params`（这是 zip/单 txt 创建任务失败的真正根因，非 zip 格式问题）
 - ❌ 静态字幕预览（历史折叠区/卡片预览）→ 已改为播放器同步字幕
 - ❌ 独立 SRT 下载按钮 / 复制 ID 按钮 / 原始响应调试按钮
 - ❌ `autoPoll` 复选框、异步 `subtitleEnable` 复选框（参数无效）
