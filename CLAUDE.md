@@ -57,8 +57,8 @@
 ## 存储 Schema
 
 **localStorage**：
-- `mm_tts_settings_v1`：`{apiKey, baseUrl, customBase, groupId, proxy, voiceId, model, speed, vol, pitch, sampleRate, bitrate, format, channel, languageBoost, outputFormat, emotion, useTextFile, textFileId, textFileName, textFileTs, saveMethod, pollInterval(0=不轮询)}`
-- `mm_tts_history_v1`：历史数组（最多 200 条）。条目字段：`{id, mode:'sync'|'async', ts, text, voiceId, model, format, speed, vol, pitch, status, errMsg, extra{durationMs,size,usage,sampleRate}, taskId, fileId, taskStatus, usage, downloadUrl, fileName, urlExpiresAt, subtitleUrl, subtitleFileName, subtitleCached, tarEntries[], extraFiles[{filename,size,cached,idx}], textFileId, manual, lastErr}`。`raws` 为历史遗留字段，saveHistory 空间不足时会自动剥离
+- `mm_tts_settings_v1`：`{apiKey, baseUrl, customBase, groupId, proxy, voiceId, model, speed, vol, pitch, sampleRate, bitrate, channel, languageBoost, outputFormat, emotion, useTextFile, textFileId, textFileName, textFileTs, saveMethod, pollInterval(0=不轮询)}`（**无 `format` 字段**：音频格式已写死 `mp3`，UI 上不提供格式选择）
+- `mm_tts_history_v1`：历史数组（最多 200 条）。条目字段：`{id, mode:'sync'|'async', ts, text, voiceId, model, format(恒为 mp3), speed, vol, pitch, status, errMsg, extra{durationMs,size,usage,sampleRate}, taskId, fileId, taskStatus, usage, downloadUrl, fileName, urlExpiresAt, subtitleUrl, subtitleFileName, subtitleCached, tarEntries[], extraFiles[{filename,size,cached,idx}], textFileId, manual, lastErr}`。`raws` 为历史遗留字段，saveHistory 空间不足时会自动剥离
 - `mm_tts_voices_v1`：`{ts, groups:{system_voice,voice_cloning,voice_generation:[{id,name}]}}`
 - `mm_tts_voice_recent_v1`：`[{id,name,ts}]` 最近使用（≤10）
 
@@ -80,7 +80,7 @@
 - **textarea 的 placeholder 被 `updateFileModeUI` 动态改写**，改原文提示时记得同步那里
 - **zip 拆分上传**：`buildZip` 用原生 `CompressionStream('deflate-raw')` 做 DEFLATE（不可用回退 STORE）并写入有效 DOS 时间戳；章节写成 JSON `{content:文本}`，**文件名必须是 `1.json`/`2.json`…（纯数字）**——`chapter_001.json` 会报 `check file in zip error`
 - 头部/手动操作区（task_id 查询、file_id 下载）在异步模式显示
-- **多章节合并下载**：zip 章节任务解包后，各段音频/字幕散落在 `<id>`（首段 mp3）、`sub:<id>`（首段 .titles）、`exf:<id>:<i>`（其余全部文件，含各章 mp3/.titles/.extra）。`mergeChapters` 按文件名 `_<N>.<ext>` 提取章节号分组，字节拼 mp3（`stripMp3Tags` 去每段 ID3v2/ID3v1），并用各章 `.extra` 的 `audio_length` 累计偏移拼 SRT；一键保存 `<base>_merged.mp3` + `<base>_merged.srt`。按钮只在音频段 ≥2 时显示（`isMergeable`）
+- **多章节合并下载**：zip 章节任务解包后，各段音频/字幕散落在 `<id>`（首段 mp3）、`sub:<id>`（首段 .titles）、`exf:<id>:<i>`（其余全部文件，含各章 mp3/.titles/.extra）。`mergeChapters` 按文件名 `_<N>.<ext>` 提取章节号分组，字节拼 mp3（`stripMp3Tags` 去每段 ID3v2/ID3v1），并用各章 `.extra` 的 `audio_length` 累计偏移拼 SRT；输出写死 mp3，一键保存 `<base>_merged.mp3` + `<base>_merged.srt`。多章节（`isMergeable`：音频段 ≥2）时点「⬇ 下载」自动走合并（`downloadEntry` 顶部拦截），无独立合并按钮
 
 ## 死代码黑名单（验证过的错误假设，勿恢复）
 

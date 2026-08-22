@@ -335,16 +335,6 @@ footer{text-align:center;font-size:11.5px;color:var(--text3);padding:4px 0 30px}
         </select>
       </div>
       <div class="field">
-        <label>格式 Format</label>
-        <select id="format">
-          <option value="mp3" selected>mp3</option>
-          <option value="wav">wav</option>
-          <option value="flac">flac</option>
-          <option value="pcm">pcm</option>
-          <option value="aac">aac</option>
-        </select>
-      </div>
-      <div class="field">
         <label>声道 Channel</label>
         <select id="channel">
           <option value="1" selected>单声道</option>
@@ -661,7 +651,7 @@ let settings = loadJSON(LS_SETTINGS, {
   apiKey:'', baseUrl:'https://api.minimaxi.com', customBase:'', groupId:'', proxy:'',
   voiceId:'male-qn-qingse', model:'speech-2.8-turbo',
   speed:1, vol:1, pitch:0,
-  sampleRate:32000, bitrate:128000, format:'mp3', channel:1,
+  sampleRate:32000, bitrate:128000, channel:1,
   languageBoost:'', outputFormat:'hex', emotion:'',
   useTextFile:false, textFileId:'', textFileName:'', textFileTs:0,
   saveMethod:'picker',
@@ -946,7 +936,7 @@ function buildVoiceSetting(){
   return v;
 }
 function buildAudioSetting(isAsync){
-  const a = { bitrate: +settings.bitrate, format: settings.format, channel: +settings.channel };
+  const a = { bitrate: +settings.bitrate, format: 'mp3', channel: +settings.channel };
   a[isAsync ? 'audio_sample_rate' : 'sample_rate'] = +settings.sampleRate;
   return a;
 }
@@ -989,13 +979,13 @@ async function runSync(){
     });
     let blob = null;
     if (url) blob = await fetchBlob(url);
-    else if (typeof d.audio === 'string') blob = new Blob([hexToBytes(d.audio)], { type: MIME[settings.format] || 'application/octet-stream' });
+    else if (typeof d.audio === 'string') blob = new Blob([hexToBytes(d.audio)], { type: 'audio/mpeg' });
     if (!blob) throw new Error('响应中未找到音频数据（可尝试切换「输出方式」为 hex）');
 
     const extra = res.extra_info || {};
     const entry = {
       id: uuid(), mode: 'sync', ts: Date.now(), text,
-      voiceId: settings.voiceId, model: settings.model, format: settings.format,
+      voiceId: settings.voiceId, model: settings.model, format: 'mp3',
       speed: +settings.speed, vol: +settings.vol, pitch: +settings.pitch,
       status: 'success', audioCached: true,
       extra: {
@@ -1036,7 +1026,7 @@ async function runSync(){
 function addFailedEntry(mode, text, errMsg){
   const entry = {
     id: uuid(), mode, ts: Date.now(), text,
-    voiceId: settings.voiceId, model: settings.model, format: settings.format,
+    voiceId: settings.voiceId, model: settings.model, format: 'mp3',
     status: 'failed', errMsg: String(errMsg).slice(0, 500)
   };
   upsertHistory(entry); renderHistory();
@@ -1061,7 +1051,7 @@ async function runAsyncCreate(){
       id: uuid(), mode: 'async', ts: Date.now(),
       text: useFile ? '（文本文件：' + settings.textFileName + '）' : text,
       textFileId: useFile ? settings.textFileId : '',
-      voiceId: settings.voiceId, model: settings.model, format: settings.format,
+      voiceId: settings.voiceId, model: settings.model, format: 'mp3',
       speed: +settings.speed, vol: +settings.vol, pitch: +settings.pitch,
       status: 'success', taskStatus: 'Processing',
       taskId: String(res.task_id),
@@ -1159,7 +1149,7 @@ async function retrieveById(id, { silent=false } = {}){
               sampleRate: ex.audio_sample_rate || '',
               size: ex.audio_size || 0,
               usage: entry.usage || ex.word_count || 0,
-              audioFormat: settings.format || ''
+              audioFormat: 'mp3'
             };
           } catch(_){}
         }
@@ -1325,10 +1315,9 @@ async function mergeChapters(id){
       }
       offset += ch.durationMs || 0;
     }
-    const ext = ((e.fileName || '').match(/\.([a-z0-9]+)$/i) || [, e.format || 'mp3'])[1].toLowerCase();
-    const blob = new Blob(parts, { type: MIME[ext] || 'audio/mpeg' });
+    const blob = new Blob(parts, { type: 'audio/mpeg' });
     const base = entryAudioBase(e) + '_merged';
-    const m = await saveBlob(blob, base + '.' + ext);
+    const m = await saveBlob(blob, base + '.mp3');
     if (m === 'cancelled') return;
     if (allSubs.length){
       const srt = subsToSrt(allSubs);
@@ -1536,7 +1525,7 @@ async function manualQuery(){
     const res = await apiCall('/v1/query/t2a_async_query_v2?task_id=' + encodeURIComponent(tid));
     const entry = {
       id: uuid(), mode: 'async', ts: Date.now(), text: '（手动查询 task_id：' + tid + '）',
-      voiceId: '', model: '', format: '',
+      voiceId: '', model: '', format: 'mp3',
       status: 'success', taskStatus: String(res.status || 'Processing'),
       taskId: tid, fileId: res.file_id != null ? String(res.file_id) : '',
       usage: 0, manual: true
@@ -1559,7 +1548,7 @@ async function manualRetrieve(){
     if (!f || !f.download_url) throw new Error('未获取到下载链接');
     const entry = {
       id: uuid(), mode: 'async', ts: Date.now(), text: '（手动下载 file_id：' + fid + '）',
-      voiceId: '', model: '', format: '',
+      voiceId: '', model: '', format: 'mp3',
       status: 'success', taskStatus: 'Success',
       taskId: '', fileId: fid,
       downloadUrl: f.download_url, fileName: f.filename || '',
@@ -1676,6 +1665,7 @@ async function playEntry(id){
 async function downloadEntry(id){
   const e = history.find(h => h.id === id);
   if (!e) return;
+  if (isMergeable(e)) return mergeChapters(id); // 多章节任务：点下载即合并为单音频 + 单字幕
   let blob = null;
   if (e.audioCached){ try { blob = await idbGet(id); } catch(_){} }
   if (!blob && e.downloadUrl){
@@ -1715,7 +1705,6 @@ function renderSyncResult(entry){
       ${ex.size ? `<span>大小：<b>${fmtBytes(ex.size)}</b></span>` : ''}
       ${ex.usage ? `<span>计费：<b>${ex.usage}</b> 字符</span>` : ''}
       ${ex.sampleRate ? `<span>采样率：<b>${ex.sampleRate} Hz</b></span>` : ''}
-      <span>格式：<b>${esc(entry.format || '')}</b></span>
     </div>
     <div class="acts">
       <button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>
@@ -1759,7 +1748,6 @@ function renderAsyncResult(entry){
       ${st === 'Success' && entry.fileId ? `<button class="btn" data-act="retrieve" data-id="${entry.id}">🔗 ${entry.downloadUrl ? '重取下载链接' : '获取下载链接'}</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="play" data-id="${entry.id}">▶ 播放</button>` : ''}
       ${entry.downloadUrl || entry.audioCached ? `<button class="btn" data-act="download" data-id="${entry.id}">⬇ 下载</button>` : ''}
-      ${isMergeable(entry) ? `<button class="btn" data-act="merge" data-id="${entry.id}">🧩 合并下载</button>` : ''}
     </div>
     ${entry.subtitleUrl || entry.subtitleCached ? `
     <div class="sub-sec">
@@ -1813,7 +1801,6 @@ function actsFor(e){
     a.push(`<button class="btn btn-sm" data-act="play" data-id="${e.id}">▶ 播放</button>`);
     a.push(`<button class="btn btn-sm" data-act="download" data-id="${e.id}">⬇ 下载</button>`);
   }
-  if (isMergeable(e)) a.push(`<button class="btn btn-sm" data-act="merge" data-id="${e.id}">🧩 合并</button>`);
   a.push(`<button class="btn btn-sm" data-act="view" data-id="${e.id}">📋 结果</button>`);
   a.push(`<button class="btn btn-sm btn-danger" data-act="del" data-id="${e.id}">🗑</button>`);
   return a.join('');
@@ -1875,7 +1862,6 @@ function syncFormFromSettings(){
   $('#pitch').value = settings.pitch; $('#vPitch').textContent = (+settings.pitch).toFixed(0);
   $('#sampleRate').value = String(settings.sampleRate);
   $('#bitrate').value = String(settings.bitrate);
-  $('#format').value = settings.format;
   $('#channel').value = String(settings.channel);
   $('#languageBoost').value = settings.languageBoost || '';
   $('#outputFormat').value = settings.outputFormat || 'hex';
@@ -1889,7 +1875,7 @@ function syncSettingsFromForm(){
   settings.model = $('#model').value;
   settings.speed = +$('#speed').value; settings.vol = +$('#vol').value; settings.pitch = +$('#pitch').value;
   settings.sampleRate = +$('#sampleRate').value; settings.bitrate = +$('#bitrate').value;
-  settings.format = $('#format').value; settings.channel = +$('#channel').value;
+  settings.channel = +$('#channel').value;
   settings.languageBoost = $('#languageBoost').value;
   settings.outputFormat = $('#outputFormat').value;
   settings.emotion = $('#emotion').value.trim();
@@ -1902,7 +1888,6 @@ function applyEntryParams(e){
   if (!e.voiceId && !e.model) return;
   if (e.voiceId) settings.voiceId = e.voiceId;
   if (e.model) settings.model = e.model;
-  if (e.format) settings.format = e.format;
   if (e.speed != null) settings.speed = e.speed;
   if (e.vol != null) settings.vol = e.vol;
   if (e.pitch != null) settings.pitch = e.pitch;
@@ -2016,7 +2001,7 @@ function bindEvents(){
   });
 
   // 参数联动保存
-  ['voiceId','model','speed','vol','pitch','sampleRate','bitrate','format','channel','languageBoost','outputFormat','emotion','pollInterval']
+  ['voiceId','model','speed','vol','pitch','sampleRate','bitrate','channel','languageBoost','outputFormat','emotion','pollInterval']
     .forEach(id => $('#' + id).addEventListener('change', syncSettingsFromForm));
   $('#speed').addEventListener('input', () => $('#vSpeed').textContent = (+$('#speed').value).toFixed(1));
   $('#vol').addEventListener('input', () => $('#vVol').textContent = (+$('#vol').value).toFixed(1));
@@ -2073,7 +2058,6 @@ function bindEvents(){
     const act = btn.dataset.act;
     if (act === 'play') playEntry(id);
     else if (act === 'download') downloadEntry(id);
-    else if (act === 'merge') mergeChapters(id);
     else if (act === 'query') queryTaskById(id);
     else if (act === 'retrieve') retrieveById(id);
     else if (act === 'dlExtra') downloadExtra(id, +btn.dataset.idx);
@@ -2098,7 +2082,6 @@ function bindEvents(){
       const id = btn.dataset.id;
       if (btn.dataset.act === 'play') playEntry(id);
       else if (btn.dataset.act === 'download') downloadEntry(id);
-      else if (btn.dataset.act === 'merge') mergeChapters(id);
       else if (btn.dataset.act === 'query') queryTaskById(id);
       else if (btn.dataset.act === 'retrieve') retrieveById(id);
       else if (btn.dataset.act === 'downloadSubRaw') downloadSubtitleRaw(id);
